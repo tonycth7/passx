@@ -170,6 +170,7 @@ a future rewrite in **Rust** is planned — same interface, same philosophy, nat
 ```sh
 git clone https://github.com/you/passx
 cd passx
+chmod +x install.sh
 bash install.sh
 ```
 
