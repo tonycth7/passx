@@ -493,15 +493,26 @@ cmd_add() {
       *)  [ -z "$user" ] && user="$arg" || notes="$arg" ;;
     esac
   done
+
+  # check before insert — give a clean error instead of a confusing one
+  [ -f "$PASSWORD_STORE_DIR/${path}.gpg" ] \
+    && err "Entry already exists: $path  (use: passx edit $path)"
+
   local pw
   pw="$(gen_password "$length")" || err "Password generation failed"
   [ -z "$pw" ] && err "Password generation produced empty result"
+
   {
     printf "%s\n" "$pw"
     [ -n "$email" ]  && printf "email: %s\n"    "$email"
     [ -n "$user"  ]  && printf "username: %s\n" "$user"
     [ -n "$notes" ]  && printf "notes: %s\n"    "$notes"
-  } | pass insert -m "$path" || err "pass insert failed — entry may already exist, use: passx edit $path"
+  } | pass insert -m -f "$path" 2>/dev/null; true
+
+  # pass insert returns non-zero even on success in some versions —
+  # verify by checking the file actually exists
+  [ -f "$PASSWORD_STORE_DIR/${path}.gpg" ]     || err "pass insert failed — check GPG key and store permissions"
+
   ok "Added: $path"
   clipboard_available && { printf "%s" "$pw" | copy_clipboard --silent; dim "Password copied to clipboard"; } || true
   debug "add: $path"
@@ -3102,3 +3113,4 @@ case "${1:-}" in
     printf "  ${C_DIM}Run ${C_BOLD}passx --help${C_RESET}${C_DIM} for the full command list${C_RESET}\n\n"
     exit 1 ;;
 esac
+

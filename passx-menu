@@ -1,0 +1,628 @@
+#!/usr/bin/env bash
+# ╔═══════════════════════════════════════════════════════════════════╗
+# ║  passx-menu  —  dmenu / rofi / wofi launcher for passx           ║
+# ║  Version: 1.0.0                                                   ║
+# ╚═══════════════════════════════════════════════════════════════════╝
+set -euo pipefail
+
+PASSX_MENU_VERSION="1.0.0"
+
+# ════════════════════════════════════════════════════════════════════
+# § CONFIGURATION
+# ════════════════════════════════════════════════════════════════════
+PASSWORD_STORE_DIR="${PASSWORD_STORE_DIR:-$HOME/.password-store}"
+
+# Load passx config if present (inherit theme, timeouts, etc.)
+PASSX_CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/passx"
+for _cf in "$PASSX_CONF_DIR/passx.conf" "${XDG_CONFIG_HOME:-$HOME/.config}/passx.conf"; do
+  [ -f "$_cf" ] && source "$_cf" && break
+done
+
+# Load passx-menu specific config (overrides passx.conf)
+[ -f "$PASSX_CONF_DIR/menu.conf" ] && source "$PASSX_CONF_DIR/menu.conf"
+
+: "${PASSX_THEME:=catppuccin}"
+: "${PASSX_CLIP_TIMEOUT:=20}"
+: "${PASSX_NOTIFY:=true}"
+
+# Menu backend: auto-detect or override with $MENU
+: "${MENU:=auto}"
+
+# dmenu flags (override with DMENU_FLAGS env)
+: "${DMENU_FONT:=monospace:size=11}"
+: "${DMENU_LINES:=20}"
+
+# ════════════════════════════════════════════════════════════════════
+# § THEME COLORS  (used by rofi inline theming)
+# ════════════════════════════════════════════════════════════════════
+_load_theme() {
+  case "${PASSX_THEME}" in
+    catppuccin)
+      T_BG="#1e1e2e";   T_BG2="#313244"; T_FG="#cdd6f4"
+      T_SEL="#cba6f7";  T_SELBG="#45475a"; T_BORDER="#89b4fa"
+      T_PROMPT="#cba6f7"; T_DM_NF="#94e2d5" T_DM_NB="#1e1e2e"
+      T_DM_SF="#1e1e2e" T_DM_SB="#cba6f7" ;;
+    nord)
+      T_BG="#2e3440";   T_BG2="#3b4252"; T_FG="#d8dee9"
+      T_SEL="#81a1c1";  T_SELBG="#4c566a"; T_BORDER="#5e81ac"
+      T_PROMPT="#81a1c1"; T_DM_NF="#d8dee9" T_DM_NB="#2e3440"
+      T_DM_SF="#2e3440" T_DM_SB="#81a1c1" ;;
+    gruvbox)
+      T_BG="#282828";   T_BG2="#3c3836"; T_FG="#ebdbb2"
+      T_SEL="#d79921";  T_SELBG="#504945"; T_BORDER="#689d6a"
+      T_PROMPT="#fabd2f"; T_DM_NF="#ebdbb2" T_DM_NB="#282828"
+      T_DM_SF="#282828" T_DM_SB="#d79921" ;;
+    dracula)
+      T_BG="#282a36";   T_BG2="#44475a"; T_FG="#f8f8f2"
+      T_SEL="#bd93f9";  T_SELBG="#44475a"; T_BORDER="#6272a4"
+      T_PROMPT="#ff79c6"; T_DM_NF="#f8f8f2" T_DM_NB="#282a36"
+      T_DM_SF="#282a36" T_DM_SB="#bd93f9" ;;
+    solarized)
+      T_BG="#002b36";   T_BG2="#073642"; T_FG="#839496"
+      T_SEL="#268bd2";  T_SELBG="#073642"; T_BORDER="#2aa198"
+      T_PROMPT="#2aa198"; T_DM_NF="#839496" T_DM_NB="#002b36"
+      T_DM_SF="#002b36" T_DM_SB="#268bd2" ;;
+    *)
+      T_BG="#1a1a2e";   T_BG2="#16213e"; T_FG="#e0e0e0"
+      T_SEL="#7c3aed";  T_SELBG="#2d2d44"; T_BORDER="#7c3aed"
+      T_PROMPT="#7c3aed"; T_DM_NF="#e0e0e0" T_DM_NB="#1a1a2e"
+      T_DM_SF="#1a1a2e" T_DM_SB="#7c3aed" ;;
+  esac
+}
+_load_theme
+
+# ════════════════════════════════════════════════════════════════════
+# § MENU BACKEND DETECTION
+# ════════════════════════════════════════════════════════════════════
+_detect_menu() {
+  [ "$MENU" != "auto" ] && { _BACKEND="$MENU"; return; }
+  command -v rofi   >/dev/null 2>&1 && { _BACKEND="rofi";  return; }
+  command -v wofi   >/dev/null 2>&1 && { _BACKEND="wofi";  return; }
+  command -v dmenu  >/dev/null 2>&1 && { _BACKEND="dmenu"; return; }
+  _BACKEND=""
+}
+_detect_menu
+
+_menu_available() { [ -n "$_BACKEND" ]; }
+
+# ════════════════════════════════════════════════════════════════════
+# § NOTIFICATIONS + ERRORS
+# ════════════════════════════════════════════════════════════════════
+_notify() {
+  local title="${1:-passx}" body="${2:-}"
+  [ "$PASSX_NOTIFY" = "true" ] || return 0
+  command -v notify-send >/dev/null 2>&1 \
+    && notify-send -a passx -t 3000 -i dialog-password "$title" "$body" 2>/dev/null || true
+}
+
+_die() {
+  _notify "passx-menu error" "$1"
+  printf "passx-menu: %s\n" "$1" >&2
+  exit 1
+}
+
+# ════════════════════════════════════════════════════════════════════
+# § MENU WRAPPER
+# ════════════════════════════════════════════════════════════════════
+# _show_menu "prompt" < items → selected item or empty
+_show_menu() {
+  local prompt="${1:-passx}"
+  case "$_BACKEND" in
+
+    rofi)
+      local _rasi; _rasi="$(mktemp /tmp/passx-menu-XXXXXX.rasi)"
+      cat > "$_rasi" <<RASI
+* {
+  bg:     ${T_BG};
+  bg2:    ${T_BG2};
+  fg:     ${T_FG};
+  sel:    ${T_SEL};
+  selbg:  ${T_SELBG};
+  border: ${T_BORDER};
+  prompt-color: ${T_PROMPT};
+  font: "${DMENU_FONT}";
+}
+window {
+  background-color: @bg;
+  border-color:     @border;
+  border:           2px;
+  border-radius:    8px;
+  width:            480px;
+}
+mainbox  { background-color: transparent; padding: 8px; }
+inputbar { background-color: @bg2; text-color: @fg; border-radius: 6px; padding: 6px 10px; margin: 0 0 6px 0; }
+prompt   { text-color: @prompt-color; }
+entry    { text-color: @fg; }
+listview { lines: ${DMENU_LINES}; spacing: 2px; background-color: transparent; }
+element  { background-color: transparent; text-color: @fg; padding: 6px 10px; border-radius: 4px; }
+element selected { background-color: @selbg; text-color: @sel; }
+element-text { background-color: transparent; text-color: inherit; }
+RASI
+      rofi -dmenu -i -p "  ${prompt}" -theme "$_rasi" -no-custom 2>/dev/null || true
+      rm -f "$_rasi" ;;
+
+    wofi)
+      local _wcss; _wcss="$(mktemp /tmp/passx-menu-XXXXXX.css)"
+      cat > "$_wcss" <<CSS
+window { background-color: ${T_BG}; border: 2px solid ${T_BORDER}; border-radius: 8px; }
+#input { background-color: ${T_BG2}; color: ${T_FG}; border-radius: 6px; margin: 6px; padding: 4px 8px; }
+#outer-box { margin: 4px; }
+#scroll { margin: 2px; }
+#text { color: ${T_FG}; padding: 4px 8px; }
+#entry:selected { background-color: ${T_SELBG}; }
+#text:selected { color: ${T_SEL}; }
+CSS
+      wofi --dmenu --insensitive \
+        --prompt "  ${prompt}" \
+        --lines "$DMENU_LINES" \
+        --style "$_wcss" \
+        2>/dev/null || true
+      rm -f "$_wcss" ;;
+
+    dmenu)
+      dmenu \
+        -i \
+        -p "  ${prompt} ❯" \
+        -fn "$DMENU_FONT" \
+        -l "$DMENU_LINES" \
+        -nb "$T_DM_NB" -nf "$T_DM_NF" \
+        -sb "$T_DM_SB" -sf "$T_DM_SF" \
+        2>/dev/null || true ;;
+
+    *)
+      # fallback: fzf in a terminal if everything else is missing
+      if command -v fzf >/dev/null 2>&1; then
+        fzf --prompt="  ${prompt} ❯ " \
+            --pointer=▶ --layout=reverse --border=rounded \
+            --height=60% 2>/dev/null || true
+      else
+        _die "No menu backend found. Install rofi, wofi, or dmenu."
+      fi ;;
+  esac
+}
+
+# ════════════════════════════════════════════════════════════════════
+# § ENTRY LISTING
+# ════════════════════════════════════════════════════════════════════
+_list_entries() {
+  # prefer pass --flat (faster, respects store structure)
+  if pass ls --flat >/dev/null 2>&1; then
+    pass ls --flat 2>/dev/null | sort
+  else
+    find "$PASSWORD_STORE_DIR" -type f -name '*.gpg' 2>/dev/null \
+      | sed "s|^$PASSWORD_STORE_DIR/||; s|\.gpg$||" | sort
+  fi
+}
+
+# ════════════════════════════════════════════════════════════════════
+# § CLIPBOARD
+# ════════════════════════════════════════════════════════════════════
+_copy() {
+  local data="$1" label="${2:-value}"
+  if command -v wl-copy  >/dev/null 2>&1; then
+    printf "%s" "$data" | wl-copy 2>/dev/null \
+      && _notify "passx" "${label} copied (clears in ${PASSX_CLIP_TIMEOUT}s)"
+  elif command -v xclip  >/dev/null 2>&1 && [ -n "${DISPLAY:-}" ]; then
+    printf "%s" "$data" | xclip -selection clipboard 2>/dev/null \
+      && _notify "passx" "${label} copied (clears in ${PASSX_CLIP_TIMEOUT}s)"
+  elif command -v clip.exe >/dev/null 2>&1; then
+    printf "%s" "$data" | clip.exe 2>/dev/null \
+      && _notify "passx" "${label} copied"
+    return 0
+  else
+    _notify "passx-menu" "No clipboard backend available"
+    return 1
+  fi
+  # Background clipboard clear
+  local t="$PASSX_CLIP_TIMEOUT"
+  ( sleep "$t"
+    { command -v wl-copy >/dev/null 2>&1 && printf "" | wl-copy 2>/dev/null; } \
+    || { command -v xclip >/dev/null 2>&1 && printf "" | xclip -selection clipboard 2>/dev/null; } \
+    || true
+    _notify "passx" "Clipboard cleared"
+  ) & disown 2>/dev/null || true
+}
+
+# ════════════════════════════════════════════════════════════════════
+# § FIELD EXTRACTION
+# ════════════════════════════════════════════════════════════════════
+_field() {
+  local entry="$1" field="$2"
+  case "$field" in
+    password) pass show "$entry" 2>/dev/null | sed -n '1p' ;;
+    full)     pass show "$entry" 2>/dev/null ;;
+    *)        pass show "$entry" 2>/dev/null \
+                | grep -m1 "^${field}:" \
+                | sed "s/^${field}: *//" ;;
+  esac
+}
+
+_has_otp() {
+  pass show "$1" 2>/dev/null | grep -qE '^otpauth://|^otp:'
+}
+
+_has_field() {
+  local v; v="$(_field "$1" "$2" 2>/dev/null)"
+  [ -n "${v:-}" ]
+}
+
+# ════════════════════════════════════════════════════════════════════
+# § ACTION MENUS
+# ════════════════════════════════════════════════════════════════════
+
+# Build the action list depending on what fields the entry has
+_build_actions() {
+  local entry="$1"
+
+  printf "🔑  copy password\n"
+
+  _has_field "$entry" username && printf "👤  copy username\n"
+  _has_field "$entry" email    && printf "📧  copy email\n"
+  _has_field "$entry" token    && printf "🪙  copy token\n"
+  _has_field "$entry" url      && printf "🔗  copy url\n"
+
+  _has_otp "$entry" && {
+    printf "⏱   otp → copy\n"
+    printf "⏱   otp → type\n"
+  }
+
+  printf "📋  show full entry\n"
+  printf "────────────────────\n"
+
+  _has_field "$entry" url && printf "🌐  open url\n"
+  command -v xdotool >/dev/null 2>&1 && {
+    printf "⌨   autofill\n"
+    printf "🚀  login\n"
+  }
+
+  printf "────────────────────\n"
+  printf "✏️   edit entry\n"
+  printf "🔄  rotate password\n"
+  printf "🔁  clone entry\n"
+  printf "📛  rename entry\n"
+  printf "🗑   delete entry\n"
+  printf "────────────────────\n"
+  printf "💪  check strength\n"
+  printf "🌩   check HIBP\n"
+  printf "🔃  sync store\n"
+  printf "────────────────────\n"
+  printf "↩   back to list\n"
+}
+
+_run_action() {
+  local entry="$1" action="$2"
+
+  case "$action" in
+
+    *"copy password")
+      local pw; pw="$(_field "$entry" password)" || { _notify "passx" "Decrypt failed"; return 1; }
+      [ -z "${pw:-}" ] && { _notify "passx" "No password in $entry"; return 1; }
+      _copy "$pw" "Password (${entry##*/})" ;;
+
+    *"copy username")
+      local u; u="$(_field "$entry" username)"
+      [ -z "${u:-}" ] && { _notify "passx" "No username in $entry"; return 1; }
+      _copy "$u" "Username" ;;
+
+    *"copy email")
+      local e; e="$(_field "$entry" email)"
+      [ -z "${e:-}" ] && { _notify "passx" "No email in $entry"; return 1; }
+      _copy "$e" "Email" ;;
+
+    *"copy token")
+      local t; t="$(_field "$entry" token)"
+      [ -z "${t:-}" ] && { _notify "passx" "No token in $entry"; return 1; }
+      _copy "$t" "Token" ;;
+
+    *"copy url")
+      local url; url="$(_field "$entry" url)"
+      [ -z "${url:-}" ] && { _notify "passx" "No url in $entry"; return 1; }
+      _copy "$url" "URL" ;;
+
+    *"otp → copy")
+      if command -v passx >/dev/null 2>&1; then
+        passx otp "$entry" 2>/dev/null \
+          && _notify "passx" "OTP copied for ${entry##*/}" \
+          || _notify "passx" "OTP failed for $entry"
+      elif command -v oathtool >/dev/null 2>&1; then
+        local secret; secret="$(pass show "$entry" 2>/dev/null | grep -m1 '^otp:' | sed 's/^otp: *//')"
+        [ -z "${secret:-}" ] && secret="$(pass show "$entry" 2>/dev/null | grep -m1 '^otpauth://' | grep -oP 'secret=\K[^&]+')"
+        [ -z "${secret:-}" ] && { _notify "passx" "No OTP secret found"; return 1; }
+        local code; code="$(oathtool --totp --base32 "$secret" 2>/dev/null)"
+        [ -n "${code:-}" ] && _copy "$code" "OTP" || _notify "passx" "OTP generation failed"
+      else
+        _notify "passx" "oathtool not installed"
+      fi ;;
+
+    *"otp → type")
+      command -v passx    >/dev/null 2>&1 || { _notify "passx" "passx not installed"; return 1; }
+      command -v xdotool  >/dev/null 2>&1 || { _notify "passx" "xdotool not installed"; return 1; }
+      passx otp-fill "$entry" 2>/dev/null \
+        && _notify "passx" "OTP typed for ${entry##*/}" \
+        || _notify "passx" "OTP fill failed" ;;
+
+    *"show full entry")
+      local content; content="$(pass show "$entry" 2>/dev/null)" \
+        || { _notify "passx" "Decrypt failed for $entry"; return 1; }
+      # Show in a new terminal or via notify
+      if command -v "${TERMINAL:-}" >/dev/null 2>&1; then
+        ${TERMINAL} -e bash -c "printf '%s\n' '$content'; read -r -p 'Press enter to close...'" &
+      else
+        # Pipe back through menu as read-only list
+        local display
+        display="$(printf "%s" "$content" \
+          | while IFS= read -r line; do
+              case "$line" in
+                *:\ *) printf "%-14s  %s\n" "${line%%: *}" "${line#*: }" ;;
+                *)     printf "%-14s  %s\n" "password"     "$line" ;;
+              esac
+            done)"
+        printf "%s\n← close" "$display" | _show_menu "$entry" >/dev/null
+      fi ;;
+
+    *"open url")
+      local url; url="$(_field "$entry" url)"
+      [ -z "${url:-}" ] && { _notify "passx" "No URL in $entry"; return 1; }
+      _notify "passx" "Opening ${url}..."
+      for opener in xdg-open open firefox chromium-browser; do
+        command -v "$opener" >/dev/null 2>&1 && { "$opener" "$url" & disown; return 0; }
+      done
+      _notify "passx" "No browser/opener found" ;;
+
+    *"autofill")
+      command -v passx   >/dev/null 2>&1 || { _notify "passx" "passx not installed"; return 1; }
+      command -v xdotool >/dev/null 2>&1 || { _notify "passx" "xdotool not installed"; return 1; }
+      sleep 0.5  # give user time to focus the target window
+      passx fill "$entry" 2>/dev/null \
+        && _notify "passx" "Autofilled ${entry##*/}" \
+        || _notify "passx" "Autofill failed" ;;
+
+    *"login")
+      command -v passx   >/dev/null 2>&1 || { _notify "passx" "passx not installed"; return 1; }
+      command -v xdotool >/dev/null 2>&1 || { _notify "passx" "xdotool not installed"; return 1; }
+      sleep 0.5
+      passx login "$entry" 2>/dev/null \
+        && _notify "passx" "Login filled for ${entry##*/}" \
+        || _notify "passx" "Login failed" ;;
+
+    *"edit entry")
+      if command -v passx >/dev/null 2>&1; then
+        local term="${TERMINAL:-}"
+        if command -v "$term" >/dev/null 2>&1; then
+          $term -e passx edit "$entry" &
+        else
+          for t in alacritty kitty st xterm; do
+            command -v "$t" >/dev/null 2>&1 && { $t -e passx edit "$entry" & break; }
+          done
+        fi
+        _notify "passx" "Editing ${entry##*/}"
+      else
+        _notify "passx" "passx not installed"
+      fi ;;
+
+    *"rotate password")
+      command -v passx >/dev/null 2>&1 || { _notify "passx" "passx not installed"; return 1; }
+      passx rotate "$entry" 2>/dev/null \
+        && _notify "passx" "Password rotated for ${entry##*/}" \
+        || _notify "passx" "Rotate failed" ;;
+
+    *"clone entry")
+      command -v passx >/dev/null 2>&1 || { _notify "passx" "passx not installed"; return 1; }
+      local dest; dest="$(printf "" | _show_menu "clone $entry → new path")"
+      [ -z "${dest:-}" ] && return 0
+      passx clone "$entry" "$dest" 2>/dev/null \
+        && _notify "passx" "Cloned to ${dest}" \
+        || _notify "passx" "Clone failed" ;;
+
+    *"rename entry")
+      command -v passx >/dev/null 2>&1 || { _notify "passx" "passx not installed"; return 1; }
+      local dest; dest="$(printf "" | _show_menu "rename $entry → new path")"
+      [ -z "${dest:-}" ] && return 0
+      passx rename "$entry" "$dest" 2>/dev/null \
+        && _notify "passx" "Renamed to ${dest}" \
+        || _notify "passx" "Rename failed" ;;
+
+    *"delete entry")
+      local confirm
+      confirm="$(printf "no\nyes — delete %s" "$entry" | _show_menu "⚠ confirm delete")"
+      [[ "${confirm:-}" == yes* ]] || { _notify "passx" "Delete cancelled"; return 0; }
+      command -v passx >/dev/null 2>&1 \
+        && passx rm "$entry" 2>/dev/null \
+        || pass rm "$entry" 2>/dev/null
+      _notify "passx" "Deleted ${entry##*/}" ;;
+
+    *"check strength")
+      command -v passx >/dev/null 2>&1 || { _notify "passx" "passx not installed"; return 1; }
+      local result; result="$(passx strength "$entry" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')"
+      printf "%s\n← close" "$result" | _show_menu "strength: ${entry##*/}" >/dev/null ;;
+
+    *"check HIBP")
+      command -v passx >/dev/null 2>&1 || { _notify "passx" "passx not installed"; return 1; }
+      _notify "passx" "Checking HIBP for ${entry##*/}..."
+      local result; result="$(passx hibp "$entry" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')"
+      printf "%s\n← close" "$result" | _show_menu "HIBP: ${entry##*/}" >/dev/null ;;
+
+    *"sync store")
+      command -v passx >/dev/null 2>&1 \
+        && passx sync 2>/dev/null \
+        || { command -v pass >/dev/null 2>&1 && pass git push 2>/dev/null; }
+      _notify "passx" "Store synced" ;;
+
+    *"back to list"|"← back"|"↩ back to list") return 1 ;;  # signal: go back
+
+  esac
+  return 0
+}
+
+# ════════════════════════════════════════════════════════════════════
+# § QUICK ACTIONS (shown at top of entry list)
+# ════════════════════════════════════════════════════════════════════
+_quick_actions() {
+  printf "⊕  add new entry\n"
+  printf "🎲  generate password\n"
+  printf "🩺  doctor\n"
+  printf "📊  stats\n"
+  printf "────────────────────\n"
+}
+
+_run_quick() {
+  local action="$1"
+  case "$action" in
+
+    *"add new entry")
+      local path; path="$(printf "" | _show_menu "new entry path (e.g. web/github)")"
+      [ -z "${path:-}" ] && return
+      local term="${TERMINAL:-}"
+      for t in "$term" alacritty kitty st xterm; do
+        command -v "$t" >/dev/null 2>&1 && { $t -e bash -c "passx add '$path'; read -rp 'Done — press enter'" & return; }
+      done
+      _notify "passx" "No terminal found to open add prompt" ;;
+
+    *"generate password")
+      local modes="random (32 chars)\nwords (5 words)\npin (6 digits)\npronounce (16 chars)"
+      local mode; mode="$(printf "%b" "$modes" | _show_menu "generate mode")"
+      [ -z "${mode:-}" ] && return
+      local pw
+      case "$mode" in
+        random*)    pw="$(LC_ALL=C tr -dc 'A-Za-z0-9@#%+=_' </dev/urandom 2>/dev/null | head -c 32)" ;;
+        words*)
+          if command -v passx >/dev/null 2>&1; then
+            pw="$(passx gen --words 5 --no-copy 2>/dev/null | head -1)"
+          else
+            pw="$(shuf -n5 /usr/share/dict/words 2>/dev/null | tr '\n' '-' | sed 's/-$//' || LC_ALL=C tr -dc 'a-z' </dev/urandom | head -c 20)"
+          fi ;;
+        pin*)       pw="$(LC_ALL=C tr -dc '0-9' </dev/urandom 2>/dev/null | head -c 6)" ;;
+        pronounce*) pw="$(LC_ALL=C tr -dc 'aeiouaeiou bcdfghjklmnprstv' </dev/urandom 2>/dev/null | head -c 16 | tr -d ' ')" ;;
+      esac
+      [ -n "${pw:-}" ] && _copy "$pw" "Generated password" ;;
+
+    *"doctor")
+      command -v passx >/dev/null 2>&1 || { _notify "passx" "passx not installed"; return; }
+      local result; result="$(passx doctor 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')"
+      printf "%s\n← close" "$result" | _show_menu "passx doctor" >/dev/null ;;
+
+    *"stats")
+      command -v passx >/dev/null 2>&1 || { _notify "passx" "passx not installed"; return; }
+      local result; result="$(passx stats 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')"
+      printf "%s\n← close" "$result" | _show_menu "passx stats" >/dev/null ;;
+
+  esac
+}
+
+# ════════════════════════════════════════════════════════════════════
+# § HELP
+# ════════════════════════════════════════════════════════════════════
+_help() {
+  cat <<EOF
+
+passx-menu $PASSX_MENU_VERSION — dmenu/rofi/wofi launcher for passx
+
+USAGE
+  passx-menu [options]
+
+OPTIONS
+  -h, --help        show this help
+  -V, --version     print version
+  -m, --menu BACKEND  force backend: dmenu | rofi | wofi
+  -t, --theme THEME   force theme: catppuccin | nord | gruvbox | dracula | solarized
+  -e, --entry PATH  jump directly to action menu for PATH
+
+ENVIRONMENT
+  MENU              menu backend (default: auto-detect)
+  PASSX_THEME       color theme (inherits from passx config)
+  PASSX_CLIP_TIMEOUT  clipboard clear timeout in seconds (default: 20)
+  PASSX_NOTIFY      desktop notifications true|false
+  DMENU_FONT        font string (default: monospace:size=11)
+  DMENU_LINES       max lines shown (default: 20)
+  TERMINAL          terminal emulator for edit/add actions
+  PASSWORD_STORE_DIR  pass store path (default: ~/.password-store)
+
+CONFIG
+  ~/.config/passx/menu.conf   source this file for persistent settings
+
+EXAMPLES
+  passx-menu                  open entry picker
+  MENU=rofi passx-menu        use rofi explicitly
+  PASSX_THEME=nord passx-menu use nord theme
+  passx-menu -e work/github   go straight to action menu
+
+KEYBINDINGS (rofi/dmenu)
+  Enter    confirm selection
+  Escape   go back / close
+
+EOF
+}
+
+# ════════════════════════════════════════════════════════════════════
+# § ARGUMENT PARSING
+# ════════════════════════════════════════════════════════════════════
+DIRECT_ENTRY=""
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help)    _help; exit 0 ;;
+    -V|--version) printf "passx-menu %s\n" "$PASSX_MENU_VERSION"; exit 0 ;;
+    -m|--menu)    MENU="${2:-}"; shift; _detect_menu ;;
+    -t|--theme)   PASSX_THEME="${2:-}"; shift; _load_theme ;;
+    -e|--entry)   DIRECT_ENTRY="${2:-}"; shift ;;
+    *) printf "Unknown option: %s\n" "$1" >&2; exit 1 ;;
+  esac
+  shift
+done
+
+# ════════════════════════════════════════════════════════════════════
+# § SANITY CHECKS
+# ════════════════════════════════════════════════════════════════════
+[ -d "$PASSWORD_STORE_DIR" ] \
+  || _die "Password store not found at $PASSWORD_STORE_DIR — run: pass init <gpg-id>"
+
+[ -f "$PASSWORD_STORE_DIR/.gpg-id" ] \
+  || _die "Store not initialized. Run: pass init <gpg-id>"
+
+# ════════════════════════════════════════════════════════════════════
+# § MAIN FLOW
+# ════════════════════════════════════════════════════════════════════
+_main() {
+
+  # If a direct entry was given, skip the picker
+  if [ -n "$DIRECT_ENTRY" ]; then
+    _entry_loop "$DIRECT_ENTRY"
+    return
+  fi
+
+  # ── Entry picker ──────────────────────────────────────────────────
+  while true; do
+    local chosen
+    chosen="$(
+      { _quick_actions; _list_entries; } | _show_menu "🔐 passx"
+    )"
+
+    [ -z "${chosen:-}" ] && return  # Escape / no selection → quit
+
+    # Strip leading emoji+space for matching
+    local clean="${chosen#*  }"
+    clean="${clean#*   }"
+
+    # Quick action?
+    case "$chosen" in
+      "⊕"*|"🎲"*|"🩺"*|"📊"*) _run_quick "$chosen"; continue ;;
+      "────"*)                   continue ;;  # separator — skip silently
+    esac
+
+    # It's an entry — go to action loop
+    _entry_loop "$chosen"
+  done
+}
+
+_entry_loop() {
+  local entry="$1"
+  while true; do
+    local action
+    action="$(_build_actions "$entry" | _show_menu "$entry")" || return
+    [ -z "${action:-}" ] && return  # Escape → back to list
+    case "$action" in "────"*) continue ;; esac  # separator — skip
+    _run_action "$entry" "$action" || return      # "back to list" returns 1
+  done
+}
+
+_main
