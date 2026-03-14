@@ -9,7 +9,7 @@ set -euo pipefail
 
 # ── Repo — change these if you fork ──────────────────────────────
 PASSX_REPO_BASE="https://raw.githubusercontent.com/tonycth7/passx/main"
-PASSX_SCRIPT_URL="${PASSX_REPO_BASE}/passx-1_0.sh"
+PASSX_SCRIPT_URL="${PASSX_REPO_BASE}/passx-1.0.sh"
 PASSX_MENU_URL="${PASSX_REPO_BASE}/passx-menu.sh"
 
 # ── Colors ───────────────────────────────────────────────────────
