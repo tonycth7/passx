@@ -525,39 +525,94 @@ cmd_git() { pass git "$@"; }
 # ════════════════════════════════════════════════════════════════
 cmd_add() {
   _cmd="add"
-  [ "$#" -lt 1 ] && err "Usage: passx add <path> [email] [username] [notes] [length]"
+  [ "$#" -lt 1 ] && err "Usage: passx add <path> [--password|-a] [email] [user] [notes] [len]"
+
   local path="$1"; shift
   local email="" user="" notes="" length="$PASSX_GEN_LENGTH"
-  for arg in "$@"; do
-    case "$arg" in
-      *@*)              email="$arg" ;;
-      [0-9]|[0-9][0-9]|[0-9][0-9][0-9]) length="$arg" ;;
-      *)  [ -z "$user" ] && user="$arg" || notes="$arg" ;;
+  local pw="" manual_pw=false ask_pw=false
+
+  # parse args — flags first, then positional
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -p|--password)
+        # --password <value>  or  --password (prompt)
+        if [ -n "${2:-}" ] && [[ "${2:-}" != -* ]]; then
+          pw="$2"; shift
+          manual_pw=true
+        else
+          ask_pw=true
+          manual_pw=true
+        fi ;;
+      --ask|-a)   ask_pw=true; manual_pw=true ;;
+      --gen|-g)   manual_pw=false ;;
+      --help|-h)  _help add; return 0 ;;
+      *@*)        email="$1" ;;
+      [0-9]|[0-9][0-9]|[0-9][0-9][0-9]) length="$1" ;;
+      *)  [ -z "$user" ] && user="$1" || notes="$1" ;;
     esac
+    shift
   done
 
-  # check before insert — give a clean error instead of a confusing one
-  [ -f "$PASSWORD_STORE_DIR/${path}.gpg" ] \
-    && err "Entry already exists: $path  (use: passx edit $path)"
+  # check entry doesn't already exist
+  [ -f "$PASSWORD_STORE_DIR/${path}.gpg" ]     && err "Entry already exists: $path  (use: passx edit $path)"
 
-  local pw
-  pw="$(gen_password "$length")" || err "Password generation failed"
-  [ -z "$pw" ] && err "Password generation produced empty result"
+  # resolve password
+  if $manual_pw; then
+    if $ask_pw || [ -z "$pw" ]; then
+      # prompt with confirmation, hidden input
+      local _stty; _stty="$(stty -g </dev/tty 2>/dev/null || true)"
+      printf "  ${C_MAGENTA}${C_BOLD}Password${C_RESET}: " >&2
+      stty -echo </dev/tty 2>/dev/null || true
+      read -r pw </dev/tty 2>/dev/null || pw=""
+      [ -n "$_stty" ] && stty "$_stty" </dev/tty 2>/dev/null || true
+      printf "
+" >&2
+      [ -z "$pw" ] && err "Password cannot be empty"
 
-  {
-    printf "%s\n" "$pw"
-    [ -n "$email" ]  && printf "email: %s\n"    "$email"
-    [ -n "$user"  ]  && printf "username: %s\n" "$user"
-    [ -n "$notes" ]  && printf "notes: %s\n"    "$notes"
+      printf "  ${C_MAGENTA}${C_BOLD}Confirm${C_RESET}:  " >&2
+      local pw2=""
+      stty -echo </dev/tty 2>/dev/null || true
+      read -r pw2 </dev/tty 2>/dev/null || pw2=""
+      [ -n "$_stty" ] && stty "$_stty" </dev/tty 2>/dev/null || true
+      printf "
+" >&2
+      [ "$pw" = "$pw2" ] || err "Passwords do not match"
+    fi
+    dim "Using provided password"
+  else
+    pw="$(gen_password "$length")" || err "Password generation failed"
+    [ -z "$pw" ] && err "Password generation produced empty result"
+    dim "Generated password (${#pw} chars)"
+  fi
+
   _gpg_env
+  {
+    printf "%s
+" "$pw"
+    [ -n "$email" ]  && printf "email: %s
+"    "$email"
+    [ -n "$user"  ]  && printf "username: %s
+" "$user"
+    [ -n "$notes" ]  && printf "notes: %s
+"    "$notes"
   } | pass insert -m -f "$path" 2>/dev/null; true
 
-  # pass insert returns non-zero even on success in some versions —
-  # verify by checking the file actually exists
   [ -f "$PASSWORD_STORE_DIR/${path}.gpg" ]     || err "pass insert failed — check GPG key and store permissions"
 
   ok "Added: $path"
-  clipboard_available && { printf "%s" "$pw" | copy_clipboard --silent; dim "Password copied to clipboard"; } || true
+  if $manual_pw; then
+    clipboard_available && {
+      printf "%s" "$pw" | copy_clipboard --silent
+      dim "Password copied to clipboard"
+    } || true
+  else
+    clipboard_available && {
+      printf "%s" "$pw" | copy_clipboard --silent
+      dim "Password copied to clipboard"
+    } || true
+    printf "  ${C_DIM}Password: %s${C_RESET}
+" "$pw"
+  fi
   debug "add: $path"
   _hook post-add "$path"
   _autosync
@@ -568,100 +623,172 @@ cmd_add() {
 # ════════════════════════════════════════════════════════════════
 cmd_template() {
   _cmd="template"
-  local show_pw=true
-  [ "${1:-}" = "-n" ] && { show_pw=false; shift; }
+  local show_pw=true ask_pw=false manual_pw="" _pwlen=""
+
+  # Flag parsing: -n (hide pw), -a/--ask/-p (prompt for own password)
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n|--no-show)  show_pw=false ;;
+      -a|--ask|-p)   ask_pw=true ;;
+      --password)    ask_pw=true; manual_pw="${2:-}"; shift ;;
+      -h|--help)     _help template; return 0 ;;
+      --) shift; break ;;
+      -*) err "Unknown flag: $1" ;;
+      *)  break ;;
+    esac
+    shift
+  done
+
   command -v fzf >/dev/null 2>&1 || err "fzf required"
+
   local ttype
   ttype="$(printf "web-login\nserver\ndatabase\napi-key\nemail-account\ncredit-card\nsoftware-license\nwifi\nnote" \
     | _fzf_pick "template" "Choose entry type" 40%)" || return 0
   [ -z "$ttype" ] && return 0
+
   printf "\n  Store path (e.g. work/github): " >&2; read -r tpath </dev/tty || true
   [ -z "${tpath:-}" ] && { dim "Aborted"; return 0; }
-  local tmp; tmp="$(mktemp)"
-  local _r _u _e _p _h _db _port _exp _cvv _name _ctype _svc _url _ssid _sec _prod _lic _gen_pw
+
+  # ── collect template-specific fields (no password inside these blocks) ──
+  local _u="" _e="" _url="" _h="" _db="" _port="" _svc=""
+  local _name="" _exp="" _cvv="" _ctype="" _ssid="" _sec=""
+  local _prod="" _lic=""
+
   case "$ttype" in
     web-login)
-      printf "  URL:      " >&2; read -r _url  </dev/tty || _url=""
-      printf "  Username: " >&2; read -r _u    </dev/tty || _u=""
-      printf "  Email:    " >&2; read -r _e    </dev/tty || _e=""
-      { printf "%s\n" "$(gen_password)"
+      printf "  URL:      " >&2; read -r _url  </dev/tty || true
+      printf "  Username: " >&2; read -r _u    </dev/tty || true
+      printf "  Email:    " >&2; read -r _e    </dev/tty || true ;;
+    server)
+      printf "  Host:     " >&2; read -r _h    </dev/tty || true
+      printf "  Username: " >&2; read -r _u    </dev/tty || true
+      printf "  Port[22]: " >&2; read -r _port </dev/tty || true
+      : "${_port:=22}"; : "${_u:=root}" ;;
+    database)
+      printf "  Host:     " >&2; read -r _h    </dev/tty || true
+      printf "  Database: " >&2; read -r _db   </dev/tty || true
+      printf "  Username: " >&2; read -r _u    </dev/tty || true
+      printf "  Port:     " >&2; read -r _port </dev/tty || true ;;
+    api-key)
+      printf "  Service:  " >&2; read -r _svc  </dev/tty || true
+      printf "  URL:      " >&2; read -r _url  </dev/tty || true
+      _pwlen=48 ;;
+    email-account)
+      printf "  Address:  " >&2; read -r _e    </dev/tty || true
+      printf "  IMAP:     " >&2; read -r _h    </dev/tty || true
+      printf "  SMTP:     " >&2; read -r _svc  </dev/tty || true ;;
+    credit-card)
+      printf "  Cardholder:    " >&2; read -r _name  </dev/tty || true
+      printf "  Number:        " >&2; read -r _db    </dev/tty || true
+      printf "  Expiry MM/YY:  " >&2; read -r _exp   </dev/tty || true
+      printf "  CVV:           " >&2; read -r _cvv   </dev/tty || true
+      printf "  Type(visa/mc): " >&2; read -r _ctype </dev/tty || true ;;
+    software-license)
+      printf "  Product:     " >&2; read -r _prod </dev/tty || true
+      printf "  Email:       " >&2; read -r _e    </dev/tty || true
+      printf "  License key: " >&2; read -r _lic  </dev/tty || true ;;
+    wifi)
+      printf "  SSID:           " >&2; read -r _ssid </dev/tty || true
+      printf "  Security[WPA2]: " >&2; read -r _sec  </dev/tty || true
+      : "${_sec:=WPA2}"; _pwlen=20 ;;
+    note)
+      local tmp; tmp="$(mktemp)"
+      printf "  Enter note (Ctrl-D when done):\n" >&2
+      cat > "$tmp"
+      pass insert -m "$tpath" < "$tmp" || { rm -f "$tmp"; err "pass insert failed"; }
+      rm -f "$tmp"
+      echo ""; ok "Created note: $tpath"; echo ""
+      _hook post-add "$tpath"; _autosync; return 0 ;;
+  esac
+
+  # ── resolve password ──
+  local _pw=""
+  if $ask_pw; then
+    # -a / --ask: prompt with hidden input + confirm, same as `passx add -a`
+    if [ -n "$manual_pw" ]; then
+      _pw="$manual_pw"
+    else
+      local _stty; _stty="$(stty -g </dev/tty 2>/dev/null || true)"
+      printf "  ${C_MAGENTA}${C_BOLD}Password${C_RESET}: " >&2
+      stty -echo </dev/tty 2>/dev/null || true
+      read -r _pw </dev/tty 2>/dev/null || _pw=""
+      [ -n "$_stty" ] && stty "$_stty" </dev/tty 2>/dev/null || true
+      printf "\n" >&2
+      [ -z "$_pw" ] && err "Password cannot be empty"
+
+      local _pw2=""
+      printf "  ${C_MAGENTA}${C_BOLD}Confirm${C_RESET}:  " >&2
+      stty -echo </dev/tty 2>/dev/null || true
+      read -r _pw2 </dev/tty 2>/dev/null || _pw2=""
+      [ -n "$_stty" ] && stty "$_stty" </dev/tty 2>/dev/null || true
+      printf "\n" >&2
+      [ "$_pw" = "$_pw2" ] || err "Passwords do not match"
+    fi
+    dim "Using provided password"
+  else
+    _pw="$(gen_password "${_pwlen:-}")"
+    [ -z "$_pw" ] && err "Password generation failed"
+    dim "Generated password (${#_pw} chars)"
+  fi
+
+  # ── build entry and insert ──
+  local tmp; tmp="$(mktemp)"
+  case "$ttype" in
+    web-login)
+      { printf "%s\n" "$_pw"
         [ -n "${_u:-}"   ] && printf "username: %s\n" "$_u"
         [ -n "${_e:-}"   ] && printf "email: %s\n"    "$_e"
         [ -n "${_url:-}" ] && printf "url: %s\n"      "$_url"; } > "$tmp" ;;
     server)
-      printf "  Host:     " >&2; read -r _h  </dev/tty || _h=""
-      printf "  Username: " >&2; read -r _u  </dev/tty || _u=""
-      printf "  Port[22]: " >&2; read -r _port </dev/tty || _port="22"
-      { printf "%s\n" "$(gen_password)"
-        printf "username: %s\n" "${_u:-root}"
+      { printf "%s\n" "$_pw"
+        printf "username: %s\n" "$_u"
         printf "host: %s\n"     "${_h:-}"
-        printf "port: %s\n"     "${_port:-22}"; } > "$tmp" ;;
+        printf "port: %s\n"     "$_port"; } > "$tmp" ;;
     database)
-      printf "  Host:     " >&2; read -r _h    </dev/tty || _h=""
-      printf "  Database: " >&2; read -r _db   </dev/tty || _db=""
-      printf "  Username: " >&2; read -r _u    </dev/tty || _u=""
-      printf "  Port:     " >&2; read -r _port </dev/tty || _port=""
-      { printf "%s\n" "$(gen_password)"
-        printf "username: %s\n" "${_u:-}"
-        printf "host: %s\n"     "${_h:-}"
-        printf "database: %s\n" "${_db:-}"
+      { printf "%s\n" "$_pw"
+        printf "username: %s\n"  "${_u:-}"
+        printf "host: %s\n"      "${_h:-}"
+        printf "database: %s\n"  "${_db:-}"
         [ -n "${_port:-}" ] && printf "port: %s\n" "$_port"; } > "$tmp" ;;
     api-key)
-      printf "  Service:  " >&2; read -r _svc </dev/tty || _svc=""
-      printf "  URL:      " >&2; read -r _url </dev/tty || _url=""
-      { printf "%s\n" "$(gen_password 48)"
+      { printf "%s\n" "$_pw"
         printf "service: %s\n" "${_svc:-}"
         [ -n "${_url:-}" ] && printf "url: %s\n" "$_url"
         printf "token: \n"; } > "$tmp" ;;
     email-account)
-      printf "  Address:  " >&2; read -r _e    </dev/tty || _e=""
-      printf "  IMAP:     " >&2; read -r _h    </dev/tty || _h=""
-      printf "  SMTP:     " >&2; read -r _svc  </dev/tty || _svc=""
-      { printf "%s\n" "$(gen_password)"
-        printf "email: %s\n"    "${_e:-}"
-        printf "imap: %s\n"     "${_h:-}"
-        printf "smtp: %s\n"     "${_svc:-}"; } > "$tmp" ;;
+      { printf "%s\n" "$_pw"
+        printf "email: %s\n" "${_e:-}"
+        printf "imap: %s\n"  "${_h:-}"
+        printf "smtp: %s\n"  "${_svc:-}"; } > "$tmp" ;;
     credit-card)
-      printf "  Cardholder: " >&2; read -r _name  </dev/tty || _name=""
-      printf "  Number:     " >&2; read -r _db     </dev/tty || _db=""
-      printf "  Expiry MM/YY: " >&2; read -r _exp  </dev/tty || _exp=""
-      printf "  CVV:        " >&2; read -r _cvv    </dev/tty || _cvv=""
-      printf "  Type(visa/mc): " >&2; read -r _ctype </dev/tty || _ctype=""
       { printf "%s\n" "${_cvv:-}"
         printf "name: %s\n"   "${_name:-}"
         printf "number: %s\n" "${_db:-}"
         printf "expiry: %s\n" "${_exp:-}"
         printf "type: %s\n"   "${_ctype:-}"; } > "$tmp" ;;
     software-license)
-      printf "  Product:  " >&2; read -r _prod </dev/tty || _prod=""
-      printf "  Email:    " >&2; read -r _e    </dev/tty || _e=""
-      printf "  License key: " >&2; read -r _lic </dev/tty || _lic=""
       { printf "%s\n" "${_lic:-}"
         printf "product: %s\n" "${_prod:-}"
         printf "email: %s\n"   "${_e:-}"
         printf "key: %s\n"     "${_lic:-}"; } > "$tmp" ;;
     wifi)
-      printf "  SSID:     " >&2; read -r _ssid </dev/tty || _ssid=""
-      printf "  Security[WPA2]: " >&2; read -r _sec </dev/tty || _sec="WPA2"
-      { printf "%s\n" "$(gen_password 20)"
+      { printf "%s\n" "$_pw"
         printf "ssid: %s\n"     "${_ssid:-}"
-        printf "security: %s\n" "${_sec:-WPA2}"; } > "$tmp" ;;
-    note)
-      printf "  Enter note (Ctrl-D when done):\n" >&2
-      cat > "$tmp" ;;
+        printf "security: %s\n" "$_sec"; } > "$tmp" ;;
   esac
-  pass insert -m "$tpath" < "$tmp" || { rm -f "$tmp"; err "pass insert failed"; }
-  
+
+  pass insert -m -f "$tpath" < "$tmp" || { rm -f "$tmp"; err "pass insert failed"; }
   local _saved_pw; _saved_pw="$(head -n1 "$tmp")"
   rm -f "$tmp"
+
   echo ""
   ok "Created $ttype: $tpath"
   if [ -n "${_saved_pw:-}" ]; then
-    if $show_pw; then
-      printf "  ${C_BOLD}Password:${C_RESET}  ${C_GREEN}%s${C_RESET}\n" "$_saved_pw"
-    fi
-    clipboard_available && { printf "%s" "$_saved_pw" | copy_clipboard --silent
-      dim "Password copied to clipboard (clears in ${PASSX_CLIP_TIMEOUT}s)"; } || true
+    $show_pw && printf "  ${C_BOLD}Password:${C_RESET}  ${C_GREEN}%s${C_RESET}\n" "$_saved_pw"
+    clipboard_available && {
+      printf "%s" "$_saved_pw" | copy_clipboard --silent
+      dim "Password copied to clipboard (clears in ${PASSX_CLIP_TIMEOUT}s)"
+    } || true
   fi
   echo ""
   _hook post-add "$tpath"
@@ -1008,17 +1135,29 @@ cmd_note() {
       local _sel; _sel="$(printf "%s\n" "${_notes[@]}" | _fzf_pick "note" "Your notes  (${#_notes[@]} found)")" || return 0
       [ -n "${_sel:-}" ] && pass show "$_sel" 2>/dev/null ;;
     edit)
-      [ -z "$path" ] && path="$(list_entries | _fzf_pick "note" "Select entry to edit")" || true
+      if [ -z "$path" ]; then
+        local _nl; _nl="$(_list_note_entries)"
+        [ -z "${_nl:-}" ] && err "No notes found — create with: passx note add"
+        path="$(printf "%s\n" "$_nl" | _fzf_pick "note" "Notes  (select to edit)")" || true
+      fi
       [ -z "${path:-}" ] && err "No entry selected"
       _gpg_env
       env EDITOR="${EDITOR:-${VISUAL:-nvim}}" GPG_TTY="$GPG_TTY" pass edit "$path"; _autosync ;;
     copy)
-      [ -z "$path" ] && path="$(list_entries | _fzf_pick "note" "Select entry")" || true
+      if [ -z "$path" ]; then
+        local _nl; _nl="$(_list_note_entries)"
+        [ -z "${_nl:-}" ] && err "No notes found — create with: passx note add"
+        path="$(printf "%s\n" "$_nl" | _fzf_pick "note" "Notes  (select to copy)")" || true
+      fi
       [ -z "${path:-}" ] && err "No entry selected"
       local _nc; _nc="$(pass show "$path" 2>/dev/null)" || err "Cannot decrypt: $path"
       printf "%s" "$_nc" | copy_clipboard && ok "Note copied" ;;
     *)
-      [ -z "$path" ] && path="$(list_entries | _fzf_pick "note" "Select entry")" || true
+      if [ -z "$path" ]; then
+        local _nl; _nl="$(_list_note_entries)"
+        [ -z "${_nl:-}" ] && err "No notes found — create with: passx note add"
+        path="$(printf "%s\n" "$_nl" | _fzf_pick "note" "Notes  (select to show)")" || true
+      fi
       [ -z "${path:-}" ] && err "No entry selected"
       pass show "$path" 2>/dev/null ;;
   esac
@@ -1132,7 +1271,11 @@ cmd_env() {
     rm -f "$tmp"; ok "Env entry saved: $_epath"; _autosync; return 0
   fi
 
-  [ -z "$path" ] && path="$(list_entries | _fzf_pick "env" "Select entry")" || true
+  if [ -z "$path" ]; then
+    local _el; _el="$(_list_env_entries)"
+    [ -z "${_el:-}" ] && err "No env/token entries found — create with: passx env add"
+    path="$(printf "%s\n" "$_el" | _fzf_pick "env" "Env/token entries  (select to export)")" || true
+  fi
   [ -z "${path:-}" ] && err "Usage: passx env [export|dotenv|show] <path>"
   
   local e; e="$(pass show "$path" 2>/dev/null)" || err "Cannot decrypt: $path"
@@ -1233,6 +1376,42 @@ _get_otp() {
   printf "%s" "$out"
 }
 
+# ════════════════════════════════════════════════════════════════
+# § FILTERED ENTRY LISTS
+# ════════════════════════════════════════════════════════════════
+_list_otp_entries() {
+  # Only entries that have an OTP secret — no decryption if entry path is missing
+  while IFS= read -r e; do
+    [ -z "$e" ] && continue
+    pass show "$e" 2>/dev/null | grep -qE '^otpauth://|^otp:' && printf "%s\n" "$e" || true
+  done < <(list_entries)
+}
+
+_list_ssh_entries() {
+  # Entries under ssh/ — show base names (strip -pub suffix, skip -pvt)
+  list_entries | grep '^ssh/' | grep -v '\-pvt$' | sed 's/-pub$//'
+}
+
+_list_gpg_entries() {
+  # Entries under gpg/ — show base names (strip -pub suffix, skip -pvt)
+  list_entries | grep '^gpg/' | grep -v '\-pvt$' | sed 's/-pub$//'
+}
+
+_list_note_entries() {
+  while IFS= read -r e; do
+    [ -z "$e" ] && continue
+    pass show "$e" 2>/dev/null | grep -q "^note:" && printf "%s\n" "$e" || true
+  done < <(list_entries)
+}
+
+_list_env_entries() {
+  while IFS= read -r e; do
+    [ -z "$e" ] && continue
+    pass show "$e" 2>/dev/null | grep -qE "^(token|api.key|secret|key|access):" \
+      && printf "%s\n" "$e" || true
+  done < <(list_entries)
+}
+
 cmd_otp() {
   _cmd="otp"
   local no_copy=false
@@ -1246,7 +1425,12 @@ cmd_otp() {
   done
   shift $((OPTIND - 1))
   local path="${1:-}"
-  [ -z "$path" ] && path="$(list_entries | _fzf_pick "otp" "Select entry")" || true
+  if [ -z "$path" ]; then
+    info "Scanning for OTP entries…"
+    local _otp_list; _otp_list="$(_list_otp_entries)"
+    [ -z "${_otp_list:-}" ] && err "No OTP entries found — add one with: passx otp-import"
+    path="$(printf "%s\n" "$_otp_list" | _fzf_pick "otp" "OTP entries  (select to copy)")" || true
+  fi
   [ -z "${path:-}" ] && err "No entry selected"
   local out; out="$(_get_otp "$path")"
   [ -z "$out" ] && err "OTP not configured for $path"
@@ -1260,7 +1444,12 @@ cmd_otp() {
 cmd_otp_show() {
   _cmd="otp-show"
   local path="${1:-}"
-  [ -z "$path" ] && path="$(list_entries | _fzf_pick "otp-show" "Select entry")" || true
+  if [ -z "$path" ]; then
+    info "Scanning for OTP entries…"
+    local _otp_list; _otp_list="$(_list_otp_entries)"
+    [ -z "${_otp_list:-}" ] && err "No OTP entries found — add one with: passx otp-import"
+    path="$(printf "%s\n" "$_otp_list" | _fzf_pick "otp-show" "OTP entries  (select to watch live)")" || true
+  fi
   [ -z "${path:-}" ] && err "No entry selected"
   while true; do
     clear
@@ -1285,7 +1474,12 @@ cmd_otp_show() {
 cmd_otp_fill() {
   _cmd="otp-fill"
   local path="${1:-}"
-  [ -z "$path" ] && path="$(list_entries | _fzf_pick "otp-fill" "Select entry")" || true
+  if [ -z "$path" ]; then
+    info "Scanning for OTP entries…"
+    local _otp_list; _otp_list="$(_list_otp_entries)"
+    [ -z "${_otp_list:-}" ] && err "No OTP entries found — add one with: passx otp-import"
+    path="$(printf "%s\n" "$_otp_list" | _fzf_pick "otp-fill" "OTP entries  (select to autotype)")" || true
+  fi
   [ -z "${path:-}" ] && err "No entry selected"
   command -v xdotool >/dev/null 2>&1 || err "xdotool required"
   local out; out="$(_get_otp "$path")"
@@ -1784,6 +1978,36 @@ _ssh_store() {
   pass insert -m -f "${base}-pvt"  < "$pvt"          || err "Failed to store private key"
 }
 
+cmd_ssh() {
+  _cmd="ssh"
+  local keys; keys="$(_list_ssh_entries)"
+  if [ -z "${keys:-}" ]; then
+    info "No SSH keys in store — add one with: passx ssh-add"
+    return 0
+  fi
+  local chosen
+  chosen="$(printf "%s\n" "$keys" | _fzf_pick "ssh" "SSH keys  (${#keys} found)  — select key")" || return 0
+  [ -z "${chosen:-}" ] && return 0
+
+  local action
+  action="$(printf "restore to ~/.ssh + agent\ncopy public key\nssh-copy-id to host\nremove from store\nshow info" \
+    | _fzf_pick "ssh-action" "action for: ${chosen##*/}" 30%)" || return 0
+  [ -z "${action:-}" ] && return 0
+
+  case "$action" in
+    "restore"*)   cmd_ssh_set "$chosen" ;;
+    "copy public key")
+      local pub; pub="$(pass show "${chosen}-pub" 2>/dev/null)" || err "Cannot read ${chosen}-pub"
+      printf "%s\n" "$pub" | copy_clipboard && ok "Public key copied" ;;
+    "ssh-copy-id"*)  cmd_ssh_copy_id "$chosen" ;;
+    "remove"*)    cmd_ssh_rm "$chosen" ;;
+    "show info")
+      _banner "SSH key: ${chosen##*/}"
+      pass show "${chosen}-pub" 2>/dev/null | head -3
+      echo "" ;;
+  esac
+}
+
 cmd_ssh_add() {
   _cmd="ssh-add"
   local base="${1:-}"
@@ -1986,6 +2210,32 @@ _gpg_store() {
   step "Exporting private → ${base}-pvt"
   gpg --export-secret-keys --armor "$keyid" 2>/dev/null \
     | pass insert -m -f "${base}-pvt" || err "Failed to store GPG private key"
+}
+
+cmd_gpg() {
+  _cmd="gpg"
+  local keys; keys="$(_list_gpg_entries)"
+  if [ -z "${keys:-}" ]; then
+    info "No GPG keys in store — add one with: passx gpg-add"
+    return 0
+  fi
+  local chosen
+  chosen="$(printf "%s\n" "$keys" | _fzf_pick "gpg" "GPG keys  — select key")" || return 0
+  [ -z "${chosen:-}" ] && return 0
+
+  local action
+  action="$(printf "restore to keyring\nremove from store\nshow fingerprint" \
+    | _fzf_pick "gpg-action" "action for: ${chosen##*/}" 30%)" || return 0
+  [ -z "${action:-}" ] && return 0
+
+  case "$action" in
+    "restore"*)  cmd_gpg_set "${chosen}-pub" ;;
+    "remove"*)   cmd_gpg_rm "$chosen" ;;
+    "show fingerprint")
+      local pub; pub="$(pass show "${chosen}-pub" 2>/dev/null)" || err "Cannot read ${chosen}-pub"
+      printf "%s\n" "$pub" | gpg --with-fingerprint --import-options import-show \
+        --dry-run 2>/dev/null | grep -E 'uid|fingerprint' || err "gpg not available" ;;
+  esac
 }
 
 cmd_gpg_add() {
@@ -2842,15 +3092,16 @@ ${C_BOLD}  USAGE${C_RESET}
     passx <command> --help
 
 ${C_BOLD}  CORE${C_RESET}
-    ${C_GREEN}show${C_RESET}     [path] [-u|-e|-n|-p|-f]   Interactive picker + field display
+    ${C_GREEN}show${C_RESET}     [path] [-u|-e|-n|-p|-f]   Interactive picker + field display  ${C_DIM}(aliases: pick, ui)${C_RESET}
     ${C_GREEN}copy${C_RESET}     [path] [-u|-e|-n|-p|-f]   Copy field to clipboard
-    ${C_GREEN}add${C_RESET}      <path> [email] [user] [notes] [len]
+    ${C_GREEN}add${C_RESET}      <path> [--password|-a] [email] [user] [notes] [len]
     ${C_GREEN}edit${C_RESET}     [path]                Edit entry in \$EDITOR
-    ${C_GREEN}rm${C_RESET}       [path]         Delete entry (with confirmation)
+    ${C_GREEN}rm${C_RESET}       [path]         Delete entry (with confirmation)  ${C_DIM}(alias: delete)${C_RESET}
     ${C_GREEN}rotate${C_RESET}   [path] [len]   Generate new password
     ${C_GREEN}rename${C_RESET}   [old] [new]    Rename / move entry
     ${C_GREEN}clone${C_RESET}    [src] [dst]    Duplicate entry
     ${C_GREEN}search${C_RESET}   [query]        Fuzzy search
+    ${C_GREEN}ls${C_RESET}                      List all entries (pass ls)
     ${C_GREEN}gen${C_RESET}      [len] [--words|--pin|--pronounceable]
 
 ${C_BOLD}  FIELDS${C_RESET}
@@ -2859,9 +3110,9 @@ ${C_BOLD}  FIELDS${C_RESET}
     Flags: ${C_DIM}-p password  -u username  -e email  -n notes  -f full  -t token${C_RESET}
 
 ${C_BOLD}  OTP${C_RESET}
-    ${C_GREEN}otp${C_RESET}          [-n]   Copy OTP (−n = print only, no copy)
-    ${C_GREEN}otp-show${C_RESET}            Live OTP with progress bar
-    ${C_GREEN}otp-fill${C_RESET}            Type OTP into focused field (xdotool)
+    ${C_GREEN}otp${C_RESET}          [-n]   Copy OTP — picker shows only OTP-enabled entries
+    ${C_GREEN}otp-show${C_RESET}            Live OTP with progress bar — filtered picker
+    ${C_GREEN}otp-fill${C_RESET}            Type OTP into focused field — filtered picker
     ${C_GREEN}otp-list${C_RESET}            List all OTP entries
     ${C_GREEN}otp-import${C_RESET}  <qr>   Import from QR image (zbarimg)
     ${C_GREEN}otp-export${C_RESET}  [--qr <file>]
@@ -2871,7 +3122,7 @@ ${C_BOLD}  OTP${C_RESET}
 ${C_BOLD}  AUTOMATION${C_RESET}
     ${C_GREEN}fill${C_RESET}     [-e]   Autotype user + TAB + pass (−e = press Enter after)
     ${C_GREEN}login${C_RESET}          Copy username + password together
-    ${C_GREEN}url${C_RESET}            Copy URL and open in browser
+    ${C_GREEN}url${C_RESET}            Copy URL and open in browser  ${C_DIM}(alias: open)${C_RESET}
     ${C_GREEN}run${C_RESET}     <cmd>  Inject creds as env vars — never in shell history
 
 ${C_BOLD}  SECRETS${C_RESET}
@@ -2879,7 +3130,10 @@ ${C_BOLD}  SECRETS${C_RESET}
     ${C_GREEN}card${C_RESET}    [list|show|(cp-num)copy-number|(cp-cvv)copy-cvv]
     ${C_GREEN}env${C_RESET}     [list|export|dotenv|show]   Output as shell exports or .env format
     ${C_GREEN}dotenv${C_RESET}                     Alias: env dotenv
-    ${C_GREEN}template${C_RESET}                   Interactive: web/server/db/api-key/card/wifi/note
+    ${C_GREEN}template${C_RESET}  [-a] [-n]          Interactive: web/server/db/api-key/card/wifi/note
+                              ${C_DIM}-a / --ask  prompt for your own password instead of generating${C_RESET}
+                              ${C_DIM}-n          do not print password on screen${C_RESET}
+                              ${C_DIM}Shortcuts:  passx t [-a]   passx T [-a]${C_RESET}
 
 ${C_BOLD}  SECURITY${C_RESET}
     ${C_GREEN}audit${C_RESET}   [--fix]   Weak / duplicate / aged passwords
@@ -2893,6 +3147,7 @@ ${C_BOLD}  SECURITY${C_RESET}
     ${C_GREEN}recipients${C_RESET}        Show current recipients
 
 ${C_BOLD}  SSH KEYS${C_RESET}
+    ${C_GREEN}ssh${C_RESET}               Smart picker — shows only stored keys, then action menu
     ${C_GREEN}ssh-add${C_RESET}           Store SSH keypair in pass
     ${C_GREEN}ssh-set${C_RESET}           Restore key to ~/.ssh/ + ssh-agent
     ${C_GREEN}ssh-rm${C_RESET}            Remove both -pub and -pvt
@@ -2901,6 +3156,7 @@ ${C_BOLD}  SSH KEYS${C_RESET}
     ${C_GREEN}ssh-agent-status${C_RESET}  Show loaded agent keys
 
 ${C_BOLD}  GPG KEYS${C_RESET}
+    ${C_GREEN}gpg${C_RESET}               Smart picker — shows only stored keys, then action menu
     ${C_GREEN}gpg-add${C_RESET}  /  ${C_GREEN}gpg-set${C_RESET}  /  ${C_GREEN}gpg-rm${C_RESET}  /  ${C_GREEN}gpg-list${C_RESET}
 
 ${C_BOLD}  IMPORT / EXPORT${C_RESET}
@@ -2943,15 +3199,23 @@ ${C_BOLD}  ENVIRONMENT VARIABLES (and ~/.config/passx/passx.conf)${C_RESET}
 
 HELP
     ;;
-    add)    printf "\n${C_BOLD}passx add${C_RESET} <path> [email] [username] [notes] [length]\n\n"
-            printf "  Adds a new entry with a generated password.\n"
-            printf "  Args are detected by type:  email@addr  →  email field\n"
-            printf "                              number       →  password length\n"
-            printf "                              first string →  username\n"
-            printf "                              second string→  notes\n\n"
+    add)    printf "\n${C_BOLD}passx add${C_RESET} <path> [options] [email] [username] [notes] [length]\n\n"
+            printf "  Add a new entry. Password is auto-generated by default.\n\n"
+            printf "  ${C_DIM}Password flags:${C_RESET}\n"
+            printf "    --password <pw>   use a specific password\n"
+            printf "    --password        prompt for password (hidden, with confirmation)\n"
+            printf "    --ask, -a         same as --password with prompt\n"
+            printf "    --gen, -g         always generate (default)\n\n"
+            printf "  ${C_DIM}Positional args (auto-detected by type):${C_RESET}\n"
+            printf "    email@addr   →  email field\n"
+            printf "    number       →  password length (generated mode only)\n"
+            printf "    first word   →  username\n"
+            printf "    second word  →  notes\n\n"
             printf "  ${C_DIM}Examples:${C_RESET}\n"
             printf "    passx add work/github tony@email.com tony 32\n"
-            printf "    passx add personal/netflix\n\n" ;;
+            printf "    passx add personal/netflix --password\n"
+            printf "    passx add work/vpn -a tony@company.com\n"
+            printf "    passx add temp/wifi --password myWifiPass123\n\n" ;;
     show)   printf "\n${C_BOLD}passx show${C_RESET} [path] [flags]\n\n"
             printf "  With no args → fzf picker → action menu (interactive TUI)\n"
             printf "  With path only → action menu for that entry\n"
@@ -3049,12 +3313,18 @@ HELP
             printf "    passx note copy              # copy note to clipboard\n"
             printf "    passx note show              # print note\n\n" ;;
     template)
-            printf "\n${C_BOLD}passx template${C_RESET} [-n]\n\n"
+            printf "\n${C_BOLD}passx template${C_RESET} [-a] [-n]\n\n"
             printf "  Create a new entry from a template.\n"
             printf "  Types: web-login server database api-key email-account\n"
             printf "         credit-card software-license wifi note\n\n"
             printf "  ${C_DIM}Flags:${C_RESET}\n"
-            printf "    -n  do not print the generated password on screen\n\n"
+            printf "    -a, --ask   prompt for your own password instead of generating one\n"
+            printf "    -p          alias for -a\n"
+            printf "    -n          do not print the password on screen after creation\n\n"
+            printf "  ${C_DIM}Examples:${C_RESET}\n"
+            printf "    passx t               # pick type, generate password\n"
+            printf "    passx t -a            # pick type, enter your own password\n"
+            printf "    passx template -a     # same with full command name\n\n"
             printf "  Password is always copied to clipboard after creation.\n\n" ;;
     *)  printf "\n  ${C_DIM}No detailed help for '%s'.  Try: passx --help${C_RESET}\n\n" "$cmd" ;;
   esac
@@ -3104,7 +3374,7 @@ case "${1:-}" in
   card)           shift; cmd_card "$@" ;;
   env)            shift; cmd_env "$@" ;;
   dotenv)         shift; cmd_dotenv "$@" ;;
-  template|T|t)   cmd_template ;;
+  template|T|t)   shift; cmd_template "$@" ;;
   # ── Security ──────────────────────────────────────────────
   strength)       shift; cmd_strength "$@" ;;
   entropy)        shift; cmd_entropy "$@" ;;
@@ -3117,6 +3387,7 @@ case "${1:-}" in
   reencrypt)      cmd_reencrypt ;;
   # ── SSH ───────────────────────────────────────────────────
   ssh-add)        shift; cmd_ssh_add "$@" ;;
+  ssh)            cmd_ssh ;;
   ssh-set)        shift; cmd_ssh_set "$@" ;;
   ssh-rm)         shift; cmd_ssh_rm "$@" ;;
   ssh-list)       cmd_ssh_list ;;
@@ -3124,6 +3395,7 @@ case "${1:-}" in
   ssh-agent-status) cmd_ssh_agent_status ;;
   # ── GPG ───────────────────────────────────────────────────
   gpg-add)        shift; cmd_gpg_add "$@" ;;
+  gpg)            cmd_gpg ;;
   gpg-set)        shift; cmd_gpg_set "$@" ;;
   gpg-rm)         shift; cmd_gpg_rm "$@" ;;
   gpg-list)       cmd_gpg_list ;;
@@ -3154,7 +3426,6 @@ case "${1:-}" in
   completions)    shift; cmd_completions "$@" ;;
   fzf-widget)     shift; cmd_fzf_widget "${1:-bash}" ;;
   cron-check)     cmd_cron_check ;;
-  set-field)      shift; cmd_set_field "$@" ;;
   *)
     printf "\n${C_RED}${C_BOLD}  ✖  Unknown command: %s${C_RESET}\n\n" "$1" >&2
     printf "  ${C_DIM}Run ${C_BOLD}passx --help${C_RESET}${C_DIM} for the full command list${C_RESET}\n\n"
