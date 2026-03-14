@@ -704,6 +704,14 @@ else
   esac
 fi
 
+# ── Ensure git is always initialized in the store ──────────────
+# pass git init is idempotent — safe to call even on a cloned repo.
+# Without .git, passx sync/log/diff all fail with "_need_git" error.
+if [ -d "${STORE_DIR:-$HOME/.password-store}" ]     && [ -f "${STORE_DIR:-$HOME/.password-store}/.gpg-id" ]     && [ ! -d "${STORE_DIR:-$HOME/.password-store}/.git" ]; then
+  step "Initializing git in store (required for passx sync)..."
+  pass git init 2>/dev/null && ok "git initialized" || warn "pass git init failed"
+fi
+
 # SSH key hint — only relevant when a new remote was configured
 # If the user just cloned successfully they obviously have an SSH key already
 if [ "${GIT_REMOTE_URL:-}" != "" ] && ! $STORE_CLONED; then
