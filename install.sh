@@ -269,10 +269,15 @@ _fetch_install "$PASSX_MENU_URL"   "passx-menu" || true
 
 # PATH warning
 if [ "$INSTALL_DIR" = "$HOME/.local/bin" ]; then
-  [[ ":$PATH:" != *":$HOME/.local/bin:"* ]] \
-    && warn "~/.local/bin is not in PATH — add to your shell rc:
-    export PATH=\"\$HOME/.local/bin:\$PATH\""
+  [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]     && warn "~/.local/bin is not in PATH — add to your shell rc:
+    export PATH="\$HOME/.local/bin:\$PATH""
 fi
+
+# Full paths to installed binaries — used throughout the rest of the script
+# so PATH doesn't need to be correct yet (e.g. during curl | bash)
+PASSX_BIN="$INSTALL_DIR/passx"
+PASSX_MENU_BIN="$INSTALL_DIR/passx-menu"
+_passx() { "$PASSX_BIN" "$@"; }
 
 # ════════════════════════════════════════════════════════════════
 #   STEP 4 — GPG KEY
@@ -782,8 +787,8 @@ if [ -f "$CONF_FILE" ]; then
   dim "Config already exists at $CONF_FILE"
 else
   step "Generating starter config..."
-  if has passx; then
-    passx gen-conf 2>/dev/null && ok "Config generated at $CONF_FILE"
+  if [ -x "$PASSX_BIN" ]; then
+    _passx gen-conf 2>/dev/null && ok "Config generated at $CONF_FILE"
   else
     mkdir -p "$CONF_DIR"
     cat > "$CONF_FILE" <<'CONF'
@@ -819,7 +824,7 @@ _setup_completions() {
       # Write to a file in fpath — correct way for zsh
       local zfunc_dir="${HOME}/.local/share/zsh/site-functions"
       mkdir -p "$zfunc_dir"
-      passx completions zsh > "$zfunc_dir/_passx" 2>/dev/null \
+      "$PASSX_BIN" completions zsh > "$zfunc_dir/_passx" 2>/dev/null \
         || { warn "Could not write zsh completions"; return; }
       ok "zsh completion file: $zfunc_dir/_passx"
 
@@ -847,7 +852,7 @@ ZRC
       # Write to bash-completion drop-in dir
       local bcomp_dir="${HOME}/.local/share/bash-completion/completions"
       mkdir -p "$bcomp_dir"
-      passx completions bash > "$bcomp_dir/passx" 2>/dev/null \
+      "$PASSX_BIN" completions bash > "$bcomp_dir/passx" 2>/dev/null \
         || { warn "Could not write bash completions"; return; }
       ok "bash completion file: $bcomp_dir/passx"
 
@@ -872,7 +877,7 @@ BRC
     fish)
       local fdir="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions"
       mkdir -p "$fdir"
-      passx completions fish > "$fdir/passx.fish" 2>/dev/null \
+      "$PASSX_BIN" completions fish > "$fdir/passx.fish" 2>/dev/null \
         && ok "fish completions: $fdir/passx.fish" \
         || warn "Could not write fish completions" ;;
 
@@ -884,10 +889,10 @@ BRC
   esac
 }
 
-if has passx; then
+if [ -x "$PASSX_BIN" ]; then
   _setup_completions "$CURRENT_SHELL"
 else
-  warn "passx not in PATH yet — skipping completions (re-run after sourcing your shell)"
+  warn "passx binary not found at $PASSX_BIN — skipping completions"
 fi
 
 # ════════════════════════════════════════════════════════════════
