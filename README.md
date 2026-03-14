@@ -16,18 +16,18 @@ one line:
 curl -fsSL https://raw.githubusercontent.com/tonycth7/passx/main/install.sh | bash
 ```
 
-the installer handles everything — dependencies, GPG key setup, SSH key, git remote, shell completions. it detects your package manager (apt, pacman, dnf, 
-brew) and asks before touching anything.
+the installer handles everything — dependencies, GPG key setup, SSH key, git remote, shell completions. it detects your package manager (apt, pacman, dnf, brew) and asks before touching anything.
+
 ---
-Or
+
+or clone and run manually:
+
 ```sh
-git clone https://github.com/you/passx
+git clone https://github.com/tonycth7/passx
 cd passx
-chmod +x native-install.sh
-bash native-install.sh
+chmod +x install.sh
+bash install.sh
 ```
- for Native-install if you clone the Repo 
- 
 
 ---
 
@@ -48,6 +48,7 @@ bash native-install.sh
 # add entries
 passx add github tony@mail.com              # generated password
 passx add github --password                 # prompt for your own (hidden input + confirm)
+passx add github -a                         # same as --password
 passx add github --password myPass123       # supply directly
 
 # access
@@ -56,10 +57,11 @@ passx copy github                           # copy password  (auto-clears in 20s
 passx copy github -u                        # copy username
 passx show github:email                     # print email field directly
 
-# otp
-passx otp github                            # copy live TOTP code
-passx otp-show github                       # live countdown display
-passx otp-fill github                       # type code into focused window
+# otp  (picker shows only entries that have OTP configured)
+passx otp                                   # pick from OTP entries → copy live code
+passx otp github                            # copy code for specific entry
+passx otp-show                              # live countdown display — filtered picker
+passx otp-fill                              # type code into focused window — filtered picker
 
 # autofill
 passx fill github                           # type user → TAB → pass → Enter
@@ -78,6 +80,8 @@ passx rotate github                         # generate new password
 passx set-field github url https://github.com
 passx rename github work/github
 passx clone github github-personal
+passx rm github                             # delete entry  (alias: delete)
+passx ls                                    # list all entries (pass ls)
 
 # security
 passx audit                                 # weak / duplicate / aged passwords
@@ -86,8 +90,30 @@ passx hibp --all                            # check every entry against breach d
 passx strength github                       # 4-point strength rating
 passx entropy github                        # Shannon entropy in bits
 
-# templates
+# templates  (-a prompts for your own password instead of generating)
 passx template                              # interactive: web-login, server, db, api-key, card, wifi...
+passx t                                     # shortcut
+passx t -a                                  # own password mode — hidden input + confirm
+passx template -n                           # don't print password on screen after creation
+
+# secrets  (pickers show only relevant entries)
+passx note                                  # pick from entries that have a note: field
+passx note add                              # create a new note
+passx card                                  # pick from entries that have a number: field
+passx env                                   # pick from entries that have token:/api-key:/secret: fields
+
+# ssh  (shows only ssh/ entries, then action menu)
+passx ssh                                   # smart picker → restore / copy pub key / ssh-copy-id / remove
+passx ssh-add                               # store a keypair
+passx ssh-list                              # list stored keys
+passx ssh-set <key>                         # restore key to ~/.ssh + agent
+passx ssh-copy-id <key> user@host           # install public key on remote
+
+# gpg  (shows only gpg/ entries, then action menu)
+passx gpg                                   # smart picker → restore / remove / show fingerprint
+passx gpg-add                               # store a keypair
+passx gpg-list                              # list stored keys
+passx gpg-set                               # restore key to keyring
 
 # import
 passx import-bitwarden export.json
@@ -111,7 +137,7 @@ every command has `--help`:
 ```sh
 passx add --help
 passx gen --help
-passx run --help
+passx template --help
 ```
 
 ---
@@ -122,15 +148,19 @@ a rofi / wofi / dmenu launcher that gives you full passx access without a termin
 
 ```sh
 passx-menu              # main picker — entries + quick actions
-passx-menu otp          # OTP picker — all entries, live codes, copy or type
+passx-menu otp          # OTP picker — filtered to OTP entries only, live codes
 passx-menu t            # new entry from template
 passx-menu fill         # autofill service picker
 passx-menu copy         # pick entry → copy password
-passx-menu ssh          # SSH key manager
-passx-menu add          # add entry (choose: generate / own password / full terminal)
+passx-menu ssh          # SSH key manager — filtered to ssh/ entries
 passx-menu gen          # generate password → clipboard
+passx-menu add          # add entry (generate / own password / full terminal)
 passx-menu conf         # interactive settings editor
 ```
+
+**all pickers are smart** — otp shows only OTP entries, ssh shows only SSH keys. no scrolling through unrelated entries.
+
+**own password in the launcher** — when adding or using a template, choosing "my own password" prompts with a hidden input field (rofi/wofi show `●●●●`, dmenu shows a `[visible]` warning). no terminal opens unless you explicitly choose "open terminal".
 
 **action menu** (per entry) — built dynamically based on what fields exist:
 
@@ -138,11 +168,25 @@ passx-menu conf         # interactive settings editor
 - OTP → copy / type / show with countdown
 - autofill (user + TAB + pass + Enter) or type password only
 - open url in browser
-- **change password** → rotate (generate new) or set your own (hidden prompt)
-- set field — pick from list or type custom field name
+- **change password** → rotate (generate new) or set your own (hidden prompt, no terminal)
+- set field — pick from list or type custom field name; password field uses hidden input
 - edit in $EDITOR
 - rename / clone / delete
 - show full entry, check strength, check HIBP
+
+**main menu header:**
+```
+  new entry from template
+  autofill service
+  otp picker
+  ssh keys
+  gpg keys
+  generate password
+  add entry
+  audit
+  doctor
+  settings
+```
 
 **themes** — catppuccin (default), nord, gruvbox, dracula, solarized — set in `~/.config/passx/menu.conf` or via `passx-menu conf`.
 
@@ -232,7 +276,7 @@ post-sync.sh
 
 ## status
 
-**v1.0.0** — feature-complete bash implementation. production ready for daily use.
+**v1.1.0** — feature-complete bash implementation. production ready for daily use.
 
 a **Rust rewrite** is planned — same interface, same philosophy, native binary, proper error handling, package-ready for AUR and Homebrew. the bash version stays maintained until then.
 
@@ -241,5 +285,3 @@ a **Rust rewrite** is planned — same interface, same philosophy, native binary
 ## license
 
 MIT
-
----
