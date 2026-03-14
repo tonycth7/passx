@@ -177,15 +177,9 @@ RASI
         printf '#entry:selected{background-color:%s;border-radius:6px;}\n' "$T_SELBG"
         printf '#text:selected{color:%s;}\n' "$T_SEL"
       } > "$_w"
-      # --no-actions stops wofi repositioning on selection; --location=center keeps it still in DWM
       out="$(wofi --dmenu --insensitive \
         --prompt " ${prompt}" \
         --lines "$DMENU_LINES" \
-        --width 600 \
-        --location center \
-        --no-actions \
-        --define=key-hide=Escape \
-        --cache-file /dev/null \
         --style "$_w" 2>/dev/null)" || true
       rm -f "$_w" ;;
 
@@ -204,141 +198,6 @@ RASI
 
     *)
       _die "No menu backend found. Install rofi, wofi, dmenu, or fzf." ;;
-  esac
-
-  printf "%s" "$out"
-}
-
-# ══════════════════════════════════════════════════════════════════
-# FREE-TEXT INPUT  (no -no-custom — user can type anything)
-# Use for paths, usernames, email, field values, etc.
-# ══════════════════════════════════════════════════════════════════
-_input() {
-  local prompt="${1:-input}"
-  local out=""
-
-  case "$_BACKEND" in
-
-    rofi)
-      local _r; _r="$(mktemp /tmp/passx-XXXXXX.rasi)" || return 0
-      cat > "$_r" <<RASI
-* {
-  bg:   ${T_BG};   bg2: ${T_BG2};
-  fg:   ${T_FG};   sel: ${T_SEL};
-  sbg:  ${T_SELBG}; brd: ${T_BRD};
-  pc:   ${T_PC};
-  font: "${DMENU_FONT}";
-}
-window       { background-color:@bg;  border-color:@brd; border:2px solid; border-radius:10px; width:540px; }
-mainbox      { background-color:transparent; padding:10px; }
-inputbar     { background-color:@bg2; text-color:@fg; border-radius:8px;
-               padding:8px 12px; margin:0 0 8px 0; }
-prompt       { text-color:@pc; padding:0 6px 0 0; }
-entry        { text-color:@fg; }
-listview     { lines:0; spacing:0; background-color:transparent; }
-RASI
-      # NOTE: No -no-custom here — this is what lets the user type freely
-      out="$(rofi -dmenu -i -p " ${prompt}" -theme "$_r" 2>/dev/null)" || true
-      rm -f "$_r" ;;
-
-    wofi)
-      local _w; _w="$(mktemp /tmp/passx-XXXXXX.css)" || return 0
-      {
-        printf 'window{background-color:%s;border:2px solid %s;border-radius:10px;}\n' \
-          "$T_BG" "$T_BRD"
-        printf '#input{background-color:%s;color:%s;border-radius:8px;' \
-          "$T_BG2" "$T_FG"
-        printf 'margin:6px;padding:6px 10px;border:none;}\n'
-        printf '#outer-box{margin:6px;}\n'
-      } > "$_w"
-      out="$(wofi --dmenu --prompt " ${prompt}" \
-        --lines 0 --width 540 --location center \
-        --no-actions --define=key-hide=Escape \
-        --cache-file /dev/null --style "$_w" 2>/dev/null)" || true
-      rm -f "$_w" ;;
-
-    dmenu)
-      out="$(printf "" | dmenu -i -p " ${prompt} >" \
-        -fn "$DMENU_FONT" \
-        -nb "$T_NB" -nf "$T_NF" -sb "$T_SB" -sf "$T_SF" 2>/dev/null)" || true ;;
-
-    fzf)
-      # fzf: --print-query returns whatever the user typed even with no match
-      out="$(fzf --prompt=" ${prompt} > " --print-query --no-info \
-        --layout=reverse --border=rounded --height=10% \
-        < /dev/null 2>/dev/null | head -1)" || true ;;
-
-    *)
-      _die "No menu backend found." ;;
-  esac
-
-  printf "%s" "$out"
-}
-
-# ══════════════════════════════════════════════════════════════════
-# HIDDEN PASSWORD INPUT  (rofi -password / wofi --password)
-# Returns empty string if the backend can't hide input.
-# Caller must fall back to _term in that case.
-# ══════════════════════════════════════════════════════════════════
-_input_password() {
-  local prompt="${1:-password}"
-  local out=""
-
-  case "$_BACKEND" in
-
-    rofi)
-      local _r; _r="$(mktemp /tmp/passx-XXXXXX.rasi)" || return 0
-      cat > "$_r" <<RASI
-* {
-  bg:   ${T_BG};   bg2: ${T_BG2};
-  fg:   ${T_FG};   sel: ${T_SEL};
-  sbg:  ${T_SELBG}; brd: ${T_BRD};
-  pc:   ${T_PC};
-  font: "${DMENU_FONT}";
-}
-window       { background-color:@bg;  border-color:@brd; border:2px solid; border-radius:10px; width:540px; }
-mainbox      { background-color:transparent; padding:10px; }
-inputbar     { background-color:@bg2; text-color:@fg; border-radius:8px;
-               padding:8px 12px; margin:0 0 8px 0; }
-prompt       { text-color:@pc; padding:0 6px 0 0; }
-entry        { text-color:@fg; }
-listview     { lines:0; spacing:0; background-color:transparent; }
-RASI
-      # -password masks keystrokes with asterisks — no -no-custom needed (empty list)
-      out="$(rofi -dmenu -password -p " ${prompt}" -theme "$_r" 2>/dev/null)" || true
-      rm -f "$_r" ;;
-
-    wofi)
-      local _w; _w="$(mktemp /tmp/passx-XXXXXX.css)" || return 0
-      {
-        printf 'window{background-color:%s;border:2px solid %s;border-radius:10px;}\n' \
-          "$T_BG" "$T_BRD"
-        printf '#input{background-color:%s;color:%s;border-radius:8px;' \
-          "$T_BG2" "$T_FG"
-        printf 'margin:6px;padding:6px 10px;border:none;}\n'
-        printf '#outer-box{margin:6px;}\n'
-      } > "$_w"
-      # --password hides the typed characters in wofi
-      out="$(wofi --dmenu --password --prompt " ${prompt}" \
-        --lines 0 --width 540 --location center \
-        --no-actions --define=key-hide=Escape \
-        --cache-file /dev/null --style "$_w" 2>/dev/null)" || true
-      rm -f "$_w" ;;
-
-    dmenu)
-      # dmenu cannot mask input — show a [visible] warning in the prompt so user knows
-      out="$(printf "" | dmenu -i -p " ${prompt} [visible] >" \
-        -fn "$DMENU_FONT" \
-        -nb "$T_NB" -nf "$T_NF" -sb "$T_SB" -sf "$T_SF" 2>/dev/null)" || true ;;
-
-    fzf)
-      # fzf cannot mask — same visible fallback
-      out="$(fzf --prompt=" ${prompt} [visible] > " --print-query --no-info \
-        --layout=reverse --border=rounded --height=10% \
-        < /dev/null 2>/dev/null | head -1)" || true ;;
-
-    *)
-      out="" ;;
   esac
 
   printf "%s" "$out"
@@ -393,37 +252,6 @@ _list_entries() {
   find "$PASSWORD_STORE_DIR" -type f -name '*.gpg' 2>/dev/null \
     | sed "s|^${PASSWORD_STORE_DIR}/||; s|\.gpg$||" \
     | sort
-}
-
-# Filtered entry lists — mirrors the helpers in passx-1_0.sh
-_list_otp_entries() {
-  while IFS= read -r e; do
-    [ -z "$e" ] && continue
-    pass show "$e" 2>/dev/null | grep -qE '^otpauth://|^otp:' && printf "%s\n" "$e" || true
-  done < <(_list_entries)
-}
-
-_list_ssh_entries() {
-  _list_entries | grep '^ssh/' | grep -v '\-pvt$' | sed 's/-pub$//' | sort -u
-}
-
-_list_gpg_entries() {
-  _list_entries | grep '^gpg/' | grep -v '\-pvt$' | sed 's/-pub$//' | sort -u
-}
-
-_list_note_entries() {
-  while IFS= read -r e; do
-    [ -z "$e" ] && continue
-    pass show "$e" 2>/dev/null | grep -q "^note:" && printf "%s\n" "$e" || true
-  done < <(_list_entries)
-}
-
-_list_env_entries() {
-  while IFS= read -r e; do
-    [ -z "$e" ] && continue
-    pass show "$e" 2>/dev/null | grep -qE "^(token|api.key|secret|key|access):" \
-      && printf "%s\n" "$e" || true
-  done < <(_list_entries)
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -491,16 +319,15 @@ _otp_code() {
 # SUB-COMMAND: otp
 # ══════════════════════════════════════════════════════════════════
 _cmd_otp() {
-  local otp_entries; otp_entries="$(_list_otp_entries)"
-  if [ -z "${otp_entries:-}" ]; then
-    _notify "passx" "No OTP entries found — add one with: passx otp-import"
-    return 0
-  fi
+  # Show ALL entries — filter to OTP ones after selection
+  # (scanning every entry for OTP requires decrypting all of them — too slow)
+  # Instead: show all, generate code, notify if none configured
 
   local entry
-  entry="$(printf "%s" "$otp_entries" | _menu "OTP  —  pick entry")"
+  entry="$(_list_entries | _menu "OTP  —  pick entry")"
   [ -z "${entry:-}" ] && return 0
 
+  # Invalidate cache for fresh decrypt
   _CACHED_ENTRY=""
 
   local code; code="$(_otp_code "$entry")"
@@ -545,159 +372,29 @@ _cmd_otp() {
 }
 
 # ══════════════════════════════════════════════════════════════════
-# PASSWORD MODE HELPER
-# Used by _cmd_add and _cmd_template to ask how to handle the password.
-# Sets globals: _PW_MODE  ("generate" | "own" | "terminal")
-#               _PW_EMAIL, _PW_USER  (optional fields collected in menu)
-# ══════════════════════════════════════════════════════════════════
-_PW_MODE="" _PW_EMAIL="" _PW_USER="" _PW_OWN=""
-
-_ask_entry_details() {
-  # _ask_entry_details "path"  — fills _PW_MODE _PW_EMAIL _PW_USER _PW_OWN
-  local path="$1"
-  _PW_MODE="" _PW_EMAIL="" _PW_USER="" _PW_OWN=""
-
-  local mode
-  mode="$(printf     "generate password  (auto)
-my own password  (type in launcher)
-open terminal  (full interactive)"     | _menu "password for: ${path##*/}")"
-  [ -z "${mode:-}" ] && return 1
-
-  case "$mode" in
-    "generate"*)  _PW_MODE="generate" ;;
-    "my own"*)    _PW_MODE="own"      ;;
-    "open"*)      _PW_MODE="terminal" ; return 0 ;;
-  esac
-
-  # For "own" mode: collect + confirm password directly in the launcher.
-  # _input_password returns empty string for dmenu/fzf (they can't hide input) —
-  # in that case we fall back to terminal so the password is never shown in clear text.
-  if [ "$_PW_MODE" = "own" ]; then
-    local pw1 pw2
-    pw1="$(_input_password " new password")"
-    if [ -z "${pw1:-}" ]; then
-      _notify "passx-menu" "Hidden input needs rofi or wofi — opening terminal instead"
-      _PW_MODE="terminal"
-      return 0
-    fi
-    pw2="$(_input_password " confirm password")"
-    if [ "$pw1" != "$pw2" ]; then
-      _notify "passx-menu" "Passwords do not match — aborted"
-      return 1
-    fi
-    _PW_OWN="$pw1"
-  fi
-
-  # collect optional fields with _input (free-text, works in all backends)
-  _PW_EMAIL="$(_input "email  (Enter to skip)")"   || _PW_EMAIL=""
-  _PW_USER="$(_input  "username  (Enter to skip)")" || _PW_USER=""
-  return 0
-}
-
-# ══════════════════════════════════════════════════════════════════
 # SUB-COMMAND: t  (template)
 # ══════════════════════════════════════════════════════════════════
 _cmd_template() {
   command -v passx >/dev/null 2>&1 || _die "passx not installed"
 
   local ttype
-  ttype="$(printf "web-login\nserver\ndatabase\napi-key\nemail-account\ncredit-card\nsoftware-license\nwifi\nnote" \
-    | _menu "new entry — template type")"
+  ttype="$(printf \
+    "web-login\nserver\ndatabase\napi-key\nemail-account\ncredit-card\nsoftware-license\nwifi\nnote" \
+    | _menu "new entry  —  template type")"
   [ -z "${ttype:-}" ] && return 0
 
   local path
-  path="$(_input "store path  (e.g. web/github)")"
+  path="$(printf "" | _menu "store path  (e.g. web/github)")"
   [ -z "${path:-}" ] && return 0
 
-  # Password mode selection
-  local pwchoice
-  pwchoice="$(printf "generate password  (auto)\nmy own password  (type in launcher)\nopen terminal  (full interactive)" \
-    | _menu "password for: ${path##*/}")"
-  [ -z "${pwchoice:-}" ] && return 0
+  # Build a command that feeds the template type and path non-interactively
+  # passx template is interactive, so we open a terminal with pre-selected type
+  local cmd
+  cmd="echo 'Creating: ${ttype} at ${path}'; echo; passx template; echo; read -rp 'press enter to close'"
 
-  # If terminal mode: just hand off and return
-  if [[ "$pwchoice" == "open"* ]]; then
-    _term "passx template" \
-      "passx template '${ttype}' '${path}' -p; echo; read -rp 'Done — press enter'" \
-      || _notify "passx" "No terminal"
-    return 0
-  fi
-
-  # Collect the own password in-launcher
-  local pw=""
-  if [[ "$pwchoice" == "my own"* ]]; then
-    local pw2=""
-    pw="$(_input_password " new password")"
-    [ -z "${pw:-}" ] && { _notify "passx-menu" "Empty password — aborted"; return 0; }
-    pw2="$(_input_password " confirm password")"
-    if [ "$pw" != "$pw2" ]; then
-      _notify "passx-menu" "Passwords do not match — aborted"
-      return 0
-    fi
-  else
-    # generate
-    command -v passx >/dev/null 2>&1 \
-      && pw="$(passx gen "$PASSX_GEN_LENGTH" --no-copy 2>/dev/null | head -1 | tr -d '[:space:]')" || true
-    [ -z "$pw" ] && pw="$(LC_ALL=C tr -dc 'A-Za-z0-9@#%+=_' </dev/urandom 2>/dev/null | head -c "$PASSX_GEN_LENGTH")"
-    [ -z "$pw" ] && { _notify "passx" "Password generation failed"; return 1; }
-  fi
-
-  # Collect per-template fields in-launcher
-  local username="" email="" url="" notes="" cardnum="" wifi_ssid="" wifi_pw="" host="" db="" api_key=""
-
-  case "$ttype" in
-    web-login)
-      username="$(_input "username  (Enter to skip)")"
-      email="$(_input    "email  (Enter to skip)")"
-      url="$(_input      "url  (Enter to skip)")"
-      ;;
-    server)
-      host="$(_input     "host / IP  (Enter to skip)")"
-      username="$(_input "username  (Enter to skip)")"
-      ;;
-    database)
-      host="$(_input     "host  (Enter to skip)")"
-      db="$(_input       "database name  (Enter to skip)")"
-      username="$(_input "username  (Enter to skip)")"
-      ;;
-    api-key)
-      url="$(_input      "service url  (Enter to skip)")"
-      ;;
-    email-account)
-      email="$(_input    "email address  (Enter to skip)")"
-      host="$(_input     "IMAP/SMTP host  (Enter to skip)")"
-      ;;
-    credit-card)
-      cardnum="$(_input  "card number  (Enter to skip)")"
-      ;;
-    wifi)
-      wifi_ssid="$(_input "SSID / network name  (Enter to skip)")"
-      ;;
-    software-license|note)
-      notes="$(_input    "notes  (Enter to skip)")"
-      ;;
-  esac
-
-  # Build the entry content and insert with pass
-  {
-    printf "%s\n" "$pw"
-    [ -n "$username"  ] && printf "username: %s\n"  "$username"
-    [ -n "$email"     ] && printf "email: %s\n"     "$email"
-    [ -n "$url"       ] && printf "url: %s\n"       "$url"
-    [ -n "$host"      ] && printf "host: %s\n"      "$host"
-    [ -n "$db"        ] && printf "database: %s\n"  "$db"
-    [ -n "$cardnum"   ] && printf "card: %s\n"      "$cardnum"
-    [ -n "$wifi_ssid" ] && printf "ssid: %s\n"      "$wifi_ssid"
-    [ -n "$notes"     ] && printf "notes: %s\n"     "$notes"
-    printf "template: %s\n" "$ttype"
-  } | pass insert -m -f "$path" 2>/dev/null
-
-  if [ -f "$PASSWORD_STORE_DIR/${path}.gpg" ]; then
-    [[ "$pwchoice" == "generate"* ]] && _clip "$pw" "Password: ${path##*/}"
-    _notify "passx" "Created ${ttype}: ${path##*/}"
-  else
-    _notify "passx" "Insert failed — check GPG setup"
-  fi
+  _term "passx  new ${ttype}" "$cmd" \
+    || _notify "passx" "No terminal — run: passx template"
+  _notify "passx" "Opening template: ${ttype} → ${path}"
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -792,7 +489,7 @@ _cmd_ssh() {
       _term "passx ssh-add" "passx ssh-add; echo; read -rp 'Done — press enter'" ;;
 
     "restore key to ~/.ssh")
-      local keys; keys="$(_list_ssh_entries)"
+      local keys; keys="$(passx ssh-list 2>/dev/null | grep -oE '[^ ]+$')" || true
       [ -z "${keys:-}" ] && { _notify "passx" "No SSH keys in store"; return; }
       local k; k="$(printf "%s" "$keys" | _menu "restore which key?")"
       [ -z "${k:-}" ] && return
@@ -801,21 +498,17 @@ _cmd_ssh() {
         || _notify "passx" "Restore failed" ;;
 
     "copy public key")
-      local keys; keys="$(_list_ssh_entries)"
-      [ -z "${keys:-}" ] && { _notify "passx" "No SSH keys in store"; return; }
-      local pub; pub="$(printf "%s" "$keys" | _menu "copy public key")"
+      local pub; pub="$(_list_entries | grep -E '\-pub$' | _menu "copy public key")"
       [ -z "${pub:-}" ] && return
       _CACHED_ENTRY=""
-      local content; content="$(_field "${pub}-pub" full 2>/dev/null)" || true
+      local content; content="$(_field "$pub" full 2>/dev/null)" || true
       [ -n "$content" ] && _clip "$content" "Public key: ${pub##*/}" \
         || _notify "passx" "Decrypt failed" ;;
 
     "ssh-copy-id to host")
-      local keys; keys="$(_list_ssh_entries)"
-      [ -z "${keys:-}" ] && { _notify "passx" "No SSH keys in store"; return; }
-      local key; key="$(printf "%s" "$keys" | _menu "which key?")"
+      local key; key="$(_list_entries | grep -E '\-pub$' | _menu "which public key?")"
       [ -z "${key:-}" ] && return
-      local host; host="$(_input "host  (user@hostname)")"
+      local host; host="$(printf "" | _menu "host  (user@hostname)")"
       [ -z "${host:-}" ] && return
       _term "passx ssh-copy-id" "passx ssh-copy-id '${key}' '${host}'; echo; read -rp 'Done — press enter'" ;;
 
@@ -827,94 +520,14 @@ _cmd_ssh() {
 }
 
 # ══════════════════════════════════════════════════════════════════
-# SUB-COMMAND: gpg
-# ══════════════════════════════════════════════════════════════════
-_cmd_gpg() {
-  command -v passx >/dev/null 2>&1 || _die "passx not installed"
-
-  local action
-  action="$(printf \
-    "list stored keys\nadd key to store\nrestore key to keyring\nremove from store" \
-    | _menu "GPG keys")"
-  [ -z "${action:-}" ] && return 0
-
-  case "$action" in
-    "list stored keys")
-      local r; r="$(passx gpg-list 2>/dev/null | _ansi)"
-      [ -z "$r" ] && r="No GPG keys stored"
-      printf "%s\n\nclose" "$r" | _menu "GPG keys" >/dev/null ;;
-
-    "add key to store")
-      _term "passx gpg-add" "passx gpg-add; echo; read -rp 'Done — press enter'" ;;
-
-    "restore key to keyring")
-      local keys; keys="$(_list_gpg_entries)"
-      [ -z "${keys:-}" ] && { _notify "passx" "No GPG keys in store"; return; }
-      local k; k="$(printf "%s" "$keys" | _menu "restore which key?")"
-      [ -z "${k:-}" ] && return
-      passx gpg-set "${k}-pub" 2>/dev/null \
-        && _notify "passx" "Key restored: ${k##*/}" \
-        || _notify "passx" "Restore failed" ;;
-
-    "remove from store")
-      local keys; keys="$(_list_gpg_entries)"
-      [ -z "${keys:-}" ] && { _notify "passx" "No GPG keys in store"; return; }
-      local k; k="$(printf "%s" "$keys" | _menu "remove which key?")"
-      [ -z "${k:-}" ] && return
-      passx gpg-rm "$k" 2>/dev/null \
-        && _notify "passx" "Removed: ${k##*/}" \
-        || _notify "passx" "Remove failed" ;;
-  esac
-}
-
-# ══════════════════════════════════════════════════════════════════
 # SUB-COMMAND: add
 # ══════════════════════════════════════════════════════════════════
 _cmd_add() {
   local path
-  path="$(_input "new entry path  (e.g. web/github)")"
+  path="$(printf "" | _menu "new entry path  (e.g. web/github)")"
   [ -z "${path:-}" ] && return 0
-
-  _ask_entry_details "$path" || return 0
-
-  case "$_PW_MODE" in
-    "generate")
-      # Generate password internally — no terminal needed
-      local pw=""
-      command -v passx >/dev/null 2>&1 \
-        && pw="$(passx gen "$PASSX_GEN_LENGTH" --no-copy 2>/dev/null | head -1 | tr -d '[:space:]')" || true
-      [ -z "$pw" ] && pw="$(LC_ALL=C tr -dc 'A-Za-z0-9@#%+=_' </dev/urandom 2>/dev/null | head -c "$PASSX_GEN_LENGTH")"
-      [ -z "$pw" ] && { _notify "passx" "Password generation failed"; return 1; }
-      {
-        printf "%s\n" "$pw"
-        [ -n "$_PW_EMAIL" ] && printf "email: %s\n"    "$_PW_EMAIL"
-        [ -n "$_PW_USER"  ] && printf "username: %s\n" "$_PW_USER"
-      } | pass insert -m -f "$path" 2>/dev/null
-      if [ -f "$PASSWORD_STORE_DIR/${path}.gpg" ]; then
-        _clip "$pw" "Password: ${path##*/}"
-        _notify "passx" "Added + copied: ${path##*/}"
-      else
-        _notify "passx" "Add failed — check GPG setup"
-      fi
-      ;;
-    "own")
-      # Password already collected securely in _ask_entry_details via _input_password
-      {
-        printf "%s\n" "$_PW_OWN"
-        [ -n "$_PW_EMAIL" ] && printf "email: %s\n"    "$_PW_EMAIL"
-        [ -n "$_PW_USER"  ] && printf "username: %s\n" "$_PW_USER"
-      } | pass insert -m -f "$path" 2>/dev/null
-      if [ -f "$PASSWORD_STORE_DIR/${path}.gpg" ]; then
-        _notify "passx" "Added: ${path##*/}"
-      else
-        _notify "passx" "Add failed — check GPG setup"
-      fi
-      ;;
-    "terminal")
-      _term "passx add" "passx add '${path}'; echo; read -rp 'Done — press enter'" \
-        || _notify "passx" "No terminal"
-      ;;
-  esac
+  _term "passx add" "passx add '${path}'; echo; read -rp 'Done — press enter'" \
+    || _notify "passx" "No terminal — run: passx add '${path}'"
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -960,7 +573,7 @@ _cmd_gen() {
   [ "${store:-}" = "store it" ] || return 0
 
   local spath
-  spath="$(_input "store path  (e.g. temp/pass)")"
+  spath="$(printf "" | _menu "store path  (e.g. temp/pass)")"
   [ -z "${spath:-}" ] && return 0
 
   printf "%s\n" "$pw" | pass insert -m -f "$spath" 2>/dev/null
@@ -1115,7 +728,7 @@ _cmd_conf() {
           | _menu "font  (current: ${cur_font})")"
         [ -z "${v:-}" ] && continue
         if [ "$v" = "custom..." ]; then
-          v="$(_input "type font string  (e.g. Hack:size=12)")"
+          v="$(printf "" | _menu "type font string  (e.g. Hack:size=12)")"
           [ -z "${v:-}" ] && continue
         fi
         _conf_set_val DMENU_FONT "$v"
@@ -1244,7 +857,7 @@ _build_actions() {
   printf "%s\n" "---"
   printf "edit\n"
   printf "set field\n"
-  printf "change password\n"
+  printf "rotate password\n"
   printf "rename\n"
   printf "clone\n"
   printf "delete\n"
@@ -1352,53 +965,21 @@ _run_action() {
         | _menu "which field?")"
       [ -z "${field:-}" ] && return
       [ "$field" = "custom..." ] && {
-        field="$(_input "field name")"; [ -z "${field:-}" ] && return; }
+        field="$(printf "" | _menu "field name")"; [ -z "${field:-}" ] && return; }
       local value
-      # Use hidden input for password field
-      if [ "$field" = "password" ]; then
-        local v2
-        value="$(_input_password " new password")"
-        [ -z "${value:-}" ] && return
-        v2="$(_input_password " confirm password")"
-        [ "$value" != "$v2" ] && { _notify "passx-menu" "Passwords do not match — aborted"; return; }
-      else
-        value="$(_input "value for ${field}")"
-        [ -z "${value:-}" ] && return
-      fi
+      value="$(printf "" | _menu "value for ${field}")"
+      [ -z "${value:-}" ] && return
       passx set-field "$entry" "$field" "$value" 2>/dev/null \
         && { _notify "passx" "Updated: ${field}"; _CACHED_ENTRY=""; } \
         || _notify "passx" "set-field failed" ;;
 
-    "change password")
-      local pwmode
-      pwmode="$(printf "rotate  (generate new)
-set my own password"         | _menu "change password: ${entry##*/}")"
-      [ -z "${pwmode:-}" ] && return
-
-      case "$pwmode" in
-        "rotate"*)
-          # auto-generate a new password
-          local r; r="$(passx rotate "$entry" 2>/dev/null | _ansi)" || true
-          _CACHED_ENTRY=""
-          _notify "passx" "Password rotated: ${entry##*/}" ;;
-
-        "set my own"*)
-          local new_pw new_pw2
-          new_pw="$(_input_password " new password for ${entry##*/}")"
-          [ -z "${new_pw:-}" ] && return  # empty = user pressed Escape
-          new_pw2="$(_input_password " confirm password")"
-          if [ "$new_pw" != "$new_pw2" ]; then
-            _notify "passx-menu" "Passwords do not match — aborted"
-          else
-            passx set-field "$entry" password "$new_pw" 2>/dev/null \
-              && _notify "passx" "Password updated: ${entry##*/}" \
-              || _notify "passx" "set-field failed"
-            _CACHED_ENTRY=""
-          fi ;;
-      esac ;;
+    "rotate password")
+      local r; r="$(passx rotate "$entry" 2>/dev/null | _ansi)" || true
+      _CACHED_ENTRY=""
+      _notify "passx" "Password rotated: ${entry##*/}" ;;
 
     "rename")
-      local dest; dest="$(_input "rename to  (new/path)")"
+      local dest; dest="$(printf "" | _menu "rename to  (new/path)")"
       [ -z "${dest:-}" ] && return
       passx rename "$entry" "$dest" 2>/dev/null \
         && _notify "passx" "Renamed → ${dest}" \
@@ -1406,7 +987,7 @@ set my own password"         | _menu "change password: ${entry##*/}")"
       return 1 ;;  # exit entry loop — entry no longer exists at old path
 
     "clone")
-      local dest; dest="$(_input "clone to  (new/path)")"
+      local dest; dest="$(printf "" | _menu "clone to  (new/path)")"
       [ -z "${dest:-}" ] && return
       passx clone "$entry" "$dest" 2>/dev/null \
         && _notify "passx" "Cloned → ${dest}" \
@@ -1451,7 +1032,6 @@ _header() {
   printf "  autofill service\n"
   printf "  otp picker\n"
   printf "  ssh keys\n"
-  printf "  gpg keys\n"
   printf "  generate password\n"
   printf "  add entry\n"
   printf "  audit\n"
@@ -1466,7 +1046,6 @@ _header_action() {
     *"autofill service")        _cmd_fill ;;
     *"otp picker")              _cmd_otp ;;
     *"ssh keys")                _cmd_ssh ;;
-    *"gpg keys")                _cmd_gpg ;;
     *"generate password")       _cmd_gen ;;
     *"add entry")               _cmd_add ;;
     *"settings")                _cmd_conf ;;
@@ -1504,7 +1083,7 @@ _main() {
     [ "$chosen" = "---" ] && continue
     case "$chosen" in
       "  new entry from template"|"  autofill service"|"  otp picker"|\
-      "  ssh keys"|"  gpg keys"|"  generate password"|"  add entry"|"  audit"|"  doctor"|"  settings")
+      "  ssh keys"|"  generate password"|"  add entry"|"  audit"|"  doctor"|"  settings")
         _header_action "$chosen"; continue ;;
     esac
     _entry_loop "$chosen"
@@ -1526,7 +1105,7 @@ USAGE
   passx-menu fill         autofill picker
   passx-menu copy         pick entry and copy password
   passx-menu ssh          SSH key manager
-  passx-menu add          add entry  (choose: generate / own password / full terminal)
+  passx-menu add          quick add entry
   passx-menu gen          generate password to clipboard
   passx-menu conf         interactive settings  (generates menu.conf)
   passx-menu conf --gen   generate menu.conf only  (no interactive)
