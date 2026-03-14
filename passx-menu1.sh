@@ -325,17 +325,9 @@ RASI
         --cache-file /dev/null --style "$_w" 2>/dev/null)" || true
       rm -f "$_w" ;;
 
-    dmenu)
-      # dmenu cannot mask input — show a [visible] warning in the prompt so user knows
-      out="$(printf "" | dmenu -i -p " ${prompt} [visible] >" \
-        -fn "$DMENU_FONT" \
-        -nb "$T_NB" -nf "$T_NF" -sb "$T_SB" -sf "$T_SF" 2>/dev/null)" || true ;;
-
-    fzf)
-      # fzf cannot mask — same visible fallback
-      out="$(fzf --prompt=" ${prompt} [visible] > " --print-query --no-info \
-        --layout=reverse --border=rounded --height=10% \
-        < /dev/null 2>/dev/null | head -1)" || true ;;
+    dmenu|fzf)
+      # dmenu and fzf cannot mask input — return empty so caller falls back to terminal
+      out="" ;;
 
     *)
       out="" ;;
@@ -393,37 +385,6 @@ _list_entries() {
   find "$PASSWORD_STORE_DIR" -type f -name '*.gpg' 2>/dev/null \
     | sed "s|^${PASSWORD_STORE_DIR}/||; s|\.gpg$||" \
     | sort
-}
-
-# Filtered entry lists — mirrors the helpers in passx-1_0.sh
-_list_otp_entries() {
-  while IFS= read -r e; do
-    [ -z "$e" ] && continue
-    pass show "$e" 2>/dev/null | grep -qE '^otpauth://|^otp:' && printf "%s\n" "$e" || true
-  done < <(_list_entries)
-}
-
-_list_ssh_entries() {
-  _list_entries | grep '^ssh/' | grep -v '\-pvt$' | sed 's/-pub$//' | sort -u
-}
-
-_list_gpg_entries() {
-  _list_entries | grep '^gpg/' | grep -v '\-pvt$' | sed 's/-pub$//' | sort -u
-}
-
-_list_note_entries() {
-  while IFS= read -r e; do
-    [ -z "$e" ] && continue
-    pass show "$e" 2>/dev/null | grep -q "^note:" && printf "%s\n" "$e" || true
-  done < <(_list_entries)
-}
-
-_list_env_entries() {
-  while IFS= read -r e; do
-    [ -z "$e" ] && continue
-    pass show "$e" 2>/dev/null | grep -qE "^(token|api.key|secret|key|access):" \
-      && printf "%s\n" "$e" || true
-  done < <(_list_entries)
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -491,16 +452,15 @@ _otp_code() {
 # SUB-COMMAND: otp
 # ══════════════════════════════════════════════════════════════════
 _cmd_otp() {
-  local otp_entries; otp_entries="$(_list_otp_entries)"
-  if [ -z "${otp_entries:-}" ]; then
-    _notify "passx" "No OTP entries found — add one with: passx otp-import"
-    return 0
-  fi
+  # Show ALL entries — filter to OTP ones after selection
+  # (scanning every entry for OTP requires decrypting all of them — too slow)
+  # Instead: show all, generate code, notify if none configured
 
   local entry
-  entry="$(printf "%s" "$otp_entries" | _menu "OTP  —  pick entry")"
+  entry="$(_list_entries | _menu "OTP  —  pick entry")"
   [ -z "${entry:-}" ] && return 0
 
+  # Invalidate cache for fresh decrypt
   _CACHED_ENTRY=""
 
   local code; code="$(_otp_code "$entry")"
@@ -601,103 +561,26 @@ _cmd_template() {
   command -v passx >/dev/null 2>&1 || _die "passx not installed"
 
   local ttype
-  ttype="$(printf "web-login\nserver\ndatabase\napi-key\nemail-account\ncredit-card\nsoftware-license\nwifi\nnote" \
-    | _menu "new entry — template type")"
+  ttype="$(printf "web-login\nserver\ndatabase\napi-key\nemail-account\ncredit-card\nsoftware-license\nwifi\nnote" | _menu "new entry — template type")"
   [ -z "${ttype:-}" ] && return 0
 
   local path
-  path="$(_input "store path  (e.g. web/github)")"
+  path="$(_input "store path (e.g. web/github)")"
   [ -z "${path:-}" ] && return 0
 
-  # Password mode selection
+  local pwflag=""
   local pwchoice
-  pwchoice="$(printf "generate password  (auto)\nmy own password  (type in launcher)\nopen terminal  (full interactive)" \
-    | _menu "password for: ${path##*/}")"
+  pwchoice="$(printf "generate password (auto)\nmy own password (type it securely)" | _menu "password for: ${path##*/}")"
   [ -z "${pwchoice:-}" ] && return 0
 
-  # If terminal mode: just hand off and return
-  if [[ "$pwchoice" == "open"* ]]; then
-    _term "passx template" \
-      "passx template '${ttype}' '${path}' -p; echo; read -rp 'Done — press enter'" \
-      || _notify "passx" "No terminal"
-    return 0
-  fi
-
-  # Collect the own password in-launcher
-  local pw=""
-  if [[ "$pwchoice" == "my own"* ]]; then
-    local pw2=""
-    pw="$(_input_password " new password")"
-    [ -z "${pw:-}" ] && { _notify "passx-menu" "Empty password — aborted"; return 0; }
-    pw2="$(_input_password " confirm password")"
-    if [ "$pw" != "$pw2" ]; then
-      _notify "passx-menu" "Passwords do not match — aborted"
-      return 0
-    fi
-  else
-    # generate
-    command -v passx >/dev/null 2>&1 \
-      && pw="$(passx gen "$PASSX_GEN_LENGTH" --no-copy 2>/dev/null | head -1 | tr -d '[:space:]')" || true
-    [ -z "$pw" ] && pw="$(LC_ALL=C tr -dc 'A-Za-z0-9@#%+=_' </dev/urandom 2>/dev/null | head -c "$PASSX_GEN_LENGTH")"
-    [ -z "$pw" ] && { _notify "passx" "Password generation failed"; return 1; }
-  fi
-
-  # Collect per-template fields in-launcher
-  local username="" email="" url="" notes="" cardnum="" wifi_ssid="" wifi_pw="" host="" db="" api_key=""
-
-  case "$ttype" in
-    web-login)
-      username="$(_input "username  (Enter to skip)")"
-      email="$(_input    "email  (Enter to skip)")"
-      url="$(_input      "url  (Enter to skip)")"
-      ;;
-    server)
-      host="$(_input     "host / IP  (Enter to skip)")"
-      username="$(_input "username  (Enter to skip)")"
-      ;;
-    database)
-      host="$(_input     "host  (Enter to skip)")"
-      db="$(_input       "database name  (Enter to skip)")"
-      username="$(_input "username  (Enter to skip)")"
-      ;;
-    api-key)
-      url="$(_input      "service url  (Enter to skip)")"
-      ;;
-    email-account)
-      email="$(_input    "email address  (Enter to skip)")"
-      host="$(_input     "IMAP/SMTP host  (Enter to skip)")"
-      ;;
-    credit-card)
-      cardnum="$(_input  "card number  (Enter to skip)")"
-      ;;
-    wifi)
-      wifi_ssid="$(_input "SSID / network name  (Enter to skip)")"
-      ;;
-    software-license|note)
-      notes="$(_input    "notes  (Enter to skip)")"
-      ;;
+  case "$pwchoice" in
+    "my own"*) pwflag=" -p";;
+    *)         pwflag="";;
   esac
 
-  # Build the entry content and insert with pass
-  {
-    printf "%s\n" "$pw"
-    [ -n "$username"  ] && printf "username: %s\n"  "$username"
-    [ -n "$email"     ] && printf "email: %s\n"     "$email"
-    [ -n "$url"       ] && printf "url: %s\n"       "$url"
-    [ -n "$host"      ] && printf "host: %s\n"      "$host"
-    [ -n "$db"        ] && printf "database: %s\n"  "$db"
-    [ -n "$cardnum"   ] && printf "card: %s\n"      "$cardnum"
-    [ -n "$wifi_ssid" ] && printf "ssid: %s\n"      "$wifi_ssid"
-    [ -n "$notes"     ] && printf "notes: %s\n"     "$notes"
-    printf "template: %s\n" "$ttype"
-  } | pass insert -m -f "$path" 2>/dev/null
-
-  if [ -f "$PASSWORD_STORE_DIR/${path}.gpg" ]; then
-    [[ "$pwchoice" == "generate"* ]] && _clip "$pw" "Password: ${path##*/}"
-    _notify "passx" "Created ${ttype}: ${path##*/}"
-  else
-    _notify "passx" "Insert failed — check GPG setup"
-  fi
+  # FIXED: Included '${ttype}' and '${path}' inside the command string
+  local cmd="passx template '${ttype}' '${path}'${pwflag}; echo; read -rp 'Done — press enter'"
+  _term "passx new ${ttype}" "$cmd" || _notify "passx" "No terminal"
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -792,7 +675,7 @@ _cmd_ssh() {
       _term "passx ssh-add" "passx ssh-add; echo; read -rp 'Done — press enter'" ;;
 
     "restore key to ~/.ssh")
-      local keys; keys="$(_list_ssh_entries)"
+      local keys; keys="$(passx ssh-list 2>/dev/null | grep -oE '[^ ]+$')" || true
       [ -z "${keys:-}" ] && { _notify "passx" "No SSH keys in store"; return; }
       local k; k="$(printf "%s" "$keys" | _menu "restore which key?")"
       [ -z "${k:-}" ] && return
@@ -801,19 +684,15 @@ _cmd_ssh() {
         || _notify "passx" "Restore failed" ;;
 
     "copy public key")
-      local keys; keys="$(_list_ssh_entries)"
-      [ -z "${keys:-}" ] && { _notify "passx" "No SSH keys in store"; return; }
-      local pub; pub="$(printf "%s" "$keys" | _menu "copy public key")"
+      local pub; pub="$(_list_entries | grep -E '\-pub$' | _menu "copy public key")"
       [ -z "${pub:-}" ] && return
       _CACHED_ENTRY=""
-      local content; content="$(_field "${pub}-pub" full 2>/dev/null)" || true
+      local content; content="$(_field "$pub" full 2>/dev/null)" || true
       [ -n "$content" ] && _clip "$content" "Public key: ${pub##*/}" \
         || _notify "passx" "Decrypt failed" ;;
 
     "ssh-copy-id to host")
-      local keys; keys="$(_list_ssh_entries)"
-      [ -z "${keys:-}" ] && { _notify "passx" "No SSH keys in store"; return; }
-      local key; key="$(printf "%s" "$keys" | _menu "which key?")"
+      local key; key="$(_list_entries | grep -E '\-pub$' | _menu "which public key?")"
       [ -z "${key:-}" ] && return
       local host; host="$(_input "host  (user@hostname)")"
       [ -z "${host:-}" ] && return
@@ -823,47 +702,6 @@ _cmd_ssh() {
       local r; r="$(passx ssh-agent-status 2>/dev/null | _ansi)"
       [ -z "$r" ] && r="ssh-agent not running or no keys loaded"
       printf "%s\n\nclose" "$r" | _menu "ssh-agent" >/dev/null ;;
-  esac
-}
-
-# ══════════════════════════════════════════════════════════════════
-# SUB-COMMAND: gpg
-# ══════════════════════════════════════════════════════════════════
-_cmd_gpg() {
-  command -v passx >/dev/null 2>&1 || _die "passx not installed"
-
-  local action
-  action="$(printf \
-    "list stored keys\nadd key to store\nrestore key to keyring\nremove from store" \
-    | _menu "GPG keys")"
-  [ -z "${action:-}" ] && return 0
-
-  case "$action" in
-    "list stored keys")
-      local r; r="$(passx gpg-list 2>/dev/null | _ansi)"
-      [ -z "$r" ] && r="No GPG keys stored"
-      printf "%s\n\nclose" "$r" | _menu "GPG keys" >/dev/null ;;
-
-    "add key to store")
-      _term "passx gpg-add" "passx gpg-add; echo; read -rp 'Done — press enter'" ;;
-
-    "restore key to keyring")
-      local keys; keys="$(_list_gpg_entries)"
-      [ -z "${keys:-}" ] && { _notify "passx" "No GPG keys in store"; return; }
-      local k; k="$(printf "%s" "$keys" | _menu "restore which key?")"
-      [ -z "${k:-}" ] && return
-      passx gpg-set "${k}-pub" 2>/dev/null \
-        && _notify "passx" "Key restored: ${k##*/}" \
-        || _notify "passx" "Restore failed" ;;
-
-    "remove from store")
-      local keys; keys="$(_list_gpg_entries)"
-      [ -z "${keys:-}" ] && { _notify "passx" "No GPG keys in store"; return; }
-      local k; k="$(printf "%s" "$keys" | _menu "remove which key?")"
-      [ -z "${k:-}" ] && return
-      passx gpg-rm "$k" 2>/dev/null \
-        && _notify "passx" "Removed: ${k##*/}" \
-        || _notify "passx" "Remove failed" ;;
   esac
 }
 
@@ -879,26 +717,14 @@ _cmd_add() {
 
   case "$_PW_MODE" in
     "generate")
-      # Generate password internally — no terminal needed
-      local pw=""
-      command -v passx >/dev/null 2>&1 \
-        && pw="$(passx gen "$PASSX_GEN_LENGTH" --no-copy 2>/dev/null | head -1 | tr -d '[:space:]')" || true
-      [ -z "$pw" ] && pw="$(LC_ALL=C tr -dc 'A-Za-z0-9@#%+=_' </dev/urandom 2>/dev/null | head -c "$PASSX_GEN_LENGTH")"
-      [ -z "$pw" ] && { _notify "passx" "Password generation failed"; return 1; }
-      {
-        printf "%s\n" "$pw"
-        [ -n "$_PW_EMAIL" ] && printf "email: %s\n"    "$_PW_EMAIL"
-        [ -n "$_PW_USER"  ] && printf "username: %s\n" "$_PW_USER"
-      } | pass insert -m -f "$path" 2>/dev/null
-      if [ -f "$PASSWORD_STORE_DIR/${path}.gpg" ]; then
-        _clip "$pw" "Password: ${path##*/}"
-        _notify "passx" "Added + copied: ${path##*/}"
-      else
-        _notify "passx" "Add failed — check GPG setup"
-      fi
+      local cmd="passx add '${path}'"
+      [ -n "$_PW_EMAIL" ] && cmd+=" '$_PW_EMAIL'"
+      [ -n "$_PW_USER"  ] && cmd+=" '$_PW_USER'"
+      _term "passx add" "${cmd}; echo; read -rp 'Done — press enter'" || _notify "passx" "No terminal"
       ;;
     "own")
-      # Password already collected securely in _ask_entry_details via _input_password
+      # Password was already collected securely in _ask_entry_details via _input_password.
+      # Build the entry directly with pass insert — no terminal needed.
       {
         printf "%s\n" "$_PW_OWN"
         [ -n "$_PW_EMAIL" ] && printf "email: %s\n"    "$_PW_EMAIL"
@@ -1354,17 +1180,8 @@ _run_action() {
       [ "$field" = "custom..." ] && {
         field="$(_input "field name")"; [ -z "${field:-}" ] && return; }
       local value
-      # Use hidden input for password field
-      if [ "$field" = "password" ]; then
-        local v2
-        value="$(_input_password " new password")"
-        [ -z "${value:-}" ] && return
-        v2="$(_input_password " confirm password")"
-        [ "$value" != "$v2" ] && { _notify "passx-menu" "Passwords do not match — aborted"; return; }
-      else
-        value="$(_input "value for ${field}")"
-        [ -z "${value:-}" ] && return
-      fi
+      value="$(_input "value for ${field}")"
+      [ -z "${value:-}" ] && return
       passx set-field "$entry" "$field" "$value" 2>/dev/null \
         && { _notify "passx" "Updated: ${field}"; _CACHED_ENTRY=""; } \
         || _notify "passx" "set-field failed" ;;
@@ -1383,17 +1200,30 @@ set my own password"         | _menu "change password: ${entry##*/}")"
           _notify "passx" "Password rotated: ${entry##*/}" ;;
 
         "set my own"*)
+          # Try to collect the new password directly in the launcher (rofi/wofi only).
+          # For dmenu/fzf, _input_password returns empty → fall back to terminal.
           local new_pw new_pw2
           new_pw="$(_input_password " new password for ${entry##*/}")"
-          [ -z "${new_pw:-}" ] && return  # empty = user pressed Escape
-          new_pw2="$(_input_password " confirm password")"
-          if [ "$new_pw" != "$new_pw2" ]; then
-            _notify "passx-menu" "Passwords do not match — aborted"
-          else
-            passx set-field "$entry" password "$new_pw" 2>/dev/null \
-              && _notify "passx" "Password updated: ${entry##*/}" \
-              || _notify "passx" "set-field failed"
+          if [ -z "${new_pw:-}" ]; then
+            # Backend can't hide input — open terminal fallback
+            local _setcmd
+            _setcmd="$(cat <<'SETCMD'
+printf '\033[35m\033[1m  New password: \033[0m'; stty -echo; read _pw; stty echo; printf '\n'; [ -z "$_pw" ] && { echo 'Aborted — empty password'; read -rp 'Press enter'; exit 1; }; printf '\033[35m\033[1m  Confirm:      \033[0m'; stty -echo; read _pw2; stty echo; printf '\n'; [ "$_pw" != "$_pw2" ] && { echo 'Passwords do not match'; read -rp 'Press enter'; exit 1; }; passx set-field "__ENTRY__" password "$_pw" && echo '  password updated' || echo '  set-field failed'; read -rp 'Press enter to close'
+SETCMD
+)"
+            _setcmd="${_setcmd//__ENTRY__/$entry}"
+            _term "set password" "$_setcmd" || _notify "passx-menu" "No terminal — run: passx set-field '$entry' password"
             _CACHED_ENTRY=""
+          else
+            new_pw2="$(_input_password " confirm password")"
+            if [ "$new_pw" != "$new_pw2" ]; then
+              _notify "passx-menu" "Passwords do not match — aborted"
+            else
+              passx set-field "$entry" password "$new_pw" 2>/dev/null \
+                && _notify "passx" "Password updated: ${entry##*/}" \
+                || _notify "passx" "set-field failed"
+              _CACHED_ENTRY=""
+            fi
           fi ;;
       esac ;;
 
@@ -1451,7 +1281,6 @@ _header() {
   printf "  autofill service\n"
   printf "  otp picker\n"
   printf "  ssh keys\n"
-  printf "  gpg keys\n"
   printf "  generate password\n"
   printf "  add entry\n"
   printf "  audit\n"
@@ -1466,7 +1295,6 @@ _header_action() {
     *"autofill service")        _cmd_fill ;;
     *"otp picker")              _cmd_otp ;;
     *"ssh keys")                _cmd_ssh ;;
-    *"gpg keys")                _cmd_gpg ;;
     *"generate password")       _cmd_gen ;;
     *"add entry")               _cmd_add ;;
     *"settings")                _cmd_conf ;;
@@ -1504,7 +1332,7 @@ _main() {
     [ "$chosen" = "---" ] && continue
     case "$chosen" in
       "  new entry from template"|"  autofill service"|"  otp picker"|\
-      "  ssh keys"|"  gpg keys"|"  generate password"|"  add entry"|"  audit"|"  doctor"|"  settings")
+      "  ssh keys"|"  generate password"|"  add entry"|"  audit"|"  doctor"|"  settings")
         _header_action "$chosen"; continue ;;
     esac
     _entry_loop "$chosen"

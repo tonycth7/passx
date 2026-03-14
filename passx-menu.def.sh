@@ -395,37 +395,6 @@ _list_entries() {
     | sort
 }
 
-# Filtered entry lists — mirrors the helpers in passx-1_0.sh
-_list_otp_entries() {
-  while IFS= read -r e; do
-    [ -z "$e" ] && continue
-    pass show "$e" 2>/dev/null | grep -qE '^otpauth://|^otp:' && printf "%s\n" "$e" || true
-  done < <(_list_entries)
-}
-
-_list_ssh_entries() {
-  _list_entries | grep '^ssh/' | grep -v '\-pvt$' | sed 's/-pub$//' | sort -u
-}
-
-_list_gpg_entries() {
-  _list_entries | grep '^gpg/' | grep -v '\-pvt$' | sed 's/-pub$//' | sort -u
-}
-
-_list_note_entries() {
-  while IFS= read -r e; do
-    [ -z "$e" ] && continue
-    pass show "$e" 2>/dev/null | grep -q "^note:" && printf "%s\n" "$e" || true
-  done < <(_list_entries)
-}
-
-_list_env_entries() {
-  while IFS= read -r e; do
-    [ -z "$e" ] && continue
-    pass show "$e" 2>/dev/null | grep -qE "^(token|api.key|secret|key|access):" \
-      && printf "%s\n" "$e" || true
-  done < <(_list_entries)
-}
-
 # ══════════════════════════════════════════════════════════════════
 # CLIPBOARD  (wl-copy → xclip → xsel → clip.exe)
 # ══════════════════════════════════════════════════════════════════
@@ -491,16 +460,15 @@ _otp_code() {
 # SUB-COMMAND: otp
 # ══════════════════════════════════════════════════════════════════
 _cmd_otp() {
-  local otp_entries; otp_entries="$(_list_otp_entries)"
-  if [ -z "${otp_entries:-}" ]; then
-    _notify "passx" "No OTP entries found — add one with: passx otp-import"
-    return 0
-  fi
+  # Show ALL entries — filter to OTP ones after selection
+  # (scanning every entry for OTP requires decrypting all of them — too slow)
+  # Instead: show all, generate code, notify if none configured
 
   local entry
-  entry="$(printf "%s" "$otp_entries" | _menu "OTP  —  pick entry")"
+  entry="$(_list_entries | _menu "OTP  —  pick entry")"
   [ -z "${entry:-}" ] && return 0
 
+  # Invalidate cache for fresh decrypt
   _CACHED_ENTRY=""
 
   local code; code="$(_otp_code "$entry")"
@@ -792,7 +760,7 @@ _cmd_ssh() {
       _term "passx ssh-add" "passx ssh-add; echo; read -rp 'Done — press enter'" ;;
 
     "restore key to ~/.ssh")
-      local keys; keys="$(_list_ssh_entries)"
+      local keys; keys="$(passx ssh-list 2>/dev/null | grep -oE '[^ ]+$')" || true
       [ -z "${keys:-}" ] && { _notify "passx" "No SSH keys in store"; return; }
       local k; k="$(printf "%s" "$keys" | _menu "restore which key?")"
       [ -z "${k:-}" ] && return
@@ -801,19 +769,15 @@ _cmd_ssh() {
         || _notify "passx" "Restore failed" ;;
 
     "copy public key")
-      local keys; keys="$(_list_ssh_entries)"
-      [ -z "${keys:-}" ] && { _notify "passx" "No SSH keys in store"; return; }
-      local pub; pub="$(printf "%s" "$keys" | _menu "copy public key")"
+      local pub; pub="$(_list_entries | grep -E '\-pub$' | _menu "copy public key")"
       [ -z "${pub:-}" ] && return
       _CACHED_ENTRY=""
-      local content; content="$(_field "${pub}-pub" full 2>/dev/null)" || true
+      local content; content="$(_field "$pub" full 2>/dev/null)" || true
       [ -n "$content" ] && _clip "$content" "Public key: ${pub##*/}" \
         || _notify "passx" "Decrypt failed" ;;
 
     "ssh-copy-id to host")
-      local keys; keys="$(_list_ssh_entries)"
-      [ -z "${keys:-}" ] && { _notify "passx" "No SSH keys in store"; return; }
-      local key; key="$(printf "%s" "$keys" | _menu "which key?")"
+      local key; key="$(_list_entries | grep -E '\-pub$' | _menu "which public key?")"
       [ -z "${key:-}" ] && return
       local host; host="$(_input "host  (user@hostname)")"
       [ -z "${host:-}" ] && return
@@ -823,47 +787,6 @@ _cmd_ssh() {
       local r; r="$(passx ssh-agent-status 2>/dev/null | _ansi)"
       [ -z "$r" ] && r="ssh-agent not running or no keys loaded"
       printf "%s\n\nclose" "$r" | _menu "ssh-agent" >/dev/null ;;
-  esac
-}
-
-# ══════════════════════════════════════════════════════════════════
-# SUB-COMMAND: gpg
-# ══════════════════════════════════════════════════════════════════
-_cmd_gpg() {
-  command -v passx >/dev/null 2>&1 || _die "passx not installed"
-
-  local action
-  action="$(printf \
-    "list stored keys\nadd key to store\nrestore key to keyring\nremove from store" \
-    | _menu "GPG keys")"
-  [ -z "${action:-}" ] && return 0
-
-  case "$action" in
-    "list stored keys")
-      local r; r="$(passx gpg-list 2>/dev/null | _ansi)"
-      [ -z "$r" ] && r="No GPG keys stored"
-      printf "%s\n\nclose" "$r" | _menu "GPG keys" >/dev/null ;;
-
-    "add key to store")
-      _term "passx gpg-add" "passx gpg-add; echo; read -rp 'Done — press enter'" ;;
-
-    "restore key to keyring")
-      local keys; keys="$(_list_gpg_entries)"
-      [ -z "${keys:-}" ] && { _notify "passx" "No GPG keys in store"; return; }
-      local k; k="$(printf "%s" "$keys" | _menu "restore which key?")"
-      [ -z "${k:-}" ] && return
-      passx gpg-set "${k}-pub" 2>/dev/null \
-        && _notify "passx" "Key restored: ${k##*/}" \
-        || _notify "passx" "Restore failed" ;;
-
-    "remove from store")
-      local keys; keys="$(_list_gpg_entries)"
-      [ -z "${keys:-}" ] && { _notify "passx" "No GPG keys in store"; return; }
-      local k; k="$(printf "%s" "$keys" | _menu "remove which key?")"
-      [ -z "${k:-}" ] && return
-      passx gpg-rm "$k" 2>/dev/null \
-        && _notify "passx" "Removed: ${k##*/}" \
-        || _notify "passx" "Remove failed" ;;
   esac
 }
 
@@ -1451,7 +1374,6 @@ _header() {
   printf "  autofill service\n"
   printf "  otp picker\n"
   printf "  ssh keys\n"
-  printf "  gpg keys\n"
   printf "  generate password\n"
   printf "  add entry\n"
   printf "  audit\n"
@@ -1466,7 +1388,6 @@ _header_action() {
     *"autofill service")        _cmd_fill ;;
     *"otp picker")              _cmd_otp ;;
     *"ssh keys")                _cmd_ssh ;;
-    *"gpg keys")                _cmd_gpg ;;
     *"generate password")       _cmd_gen ;;
     *"add entry")               _cmd_add ;;
     *"settings")                _cmd_conf ;;
@@ -1504,7 +1425,7 @@ _main() {
     [ "$chosen" = "---" ] && continue
     case "$chosen" in
       "  new entry from template"|"  autofill service"|"  otp picker"|\
-      "  ssh keys"|"  gpg keys"|"  generate password"|"  add entry"|"  audit"|"  doctor"|"  settings")
+      "  ssh keys"|"  generate password"|"  add entry"|"  audit"|"  doctor"|"  settings")
         _header_action "$chosen"; continue ;;
     esac
     _entry_loop "$chosen"
