@@ -322,7 +322,7 @@ fi
 
 # ── Create new key  ────────────────────────────────────────────
 if [ "$GPG_KEY_ID" = "__CREATE__" ]; then
-  printf "\n  ${C_BOLD}New RSA 4096 key${C_RESET}\n\n"
+  printf "\n  ${C_BOLD}New GPG key${C_RESET}\n\n"
 
   ask "Your name"
   read -r GPG_NAME </dev/tty 2>/dev/null || GPG_NAME=""
@@ -332,48 +332,104 @@ if [ "$GPG_KEY_ID" = "__CREATE__" ]; then
   read -r GPG_EMAIL </dev/tty 2>/dev/null || GPG_EMAIL=""
   [[ "$GPG_EMAIL" == *@* ]] || err "Invalid email"
 
-  printf "\n"
-  info "GPG will now ask for a passphrase via your pinentry program."
-  info "This passphrase protects every password in your store — make it strong."
-  printf "\n"
-  read -rp "  Press Enter when ready..." </dev/tty 2>/dev/null || true
+  # Read passphrase directly in the terminal with echo off
+  GPG_PASS="" GPG_PASS2=""
+  local_stty="$(stty -g </dev/tty 2>/dev/null || true)"
+  printf "\n${C_MAGENTA}${C_BOLD}  ❯  Passphrase for your key  (leave blank for none)${C_RESET} "
+  stty -echo </dev/tty 2>/dev/null || true
+  read -r GPG_PASS </dev/tty 2>/dev/null || true
+  [ -n "$local_stty" ] && stty "$local_stty" </dev/tty 2>/dev/null || true
   printf "\n"
 
-  # Use --quick-gen-key: fully interactive passphrase via pinentry agent
-  # Does NOT suppress the passphrase dialog like --batch %no-protection did
-  step "Generating key... (passphrase dialog will appear)"
-  if gpg --batch --gen-key 2>/dev/null <<EOF
-Key-Type: RSA
-Key-Length: 4096
-Subkey-Type: RSA
-Subkey-Length: 4096
-Name-Real: $GPG_NAME
-Name-Email: $GPG_EMAIL
-Expire-Date: 2y
-%commit
-EOF
-  then
-    : # batch succeeded (agent handled passphrase)
+  if [ -n "$GPG_PASS" ]; then
+    printf "${C_MAGENTA}${C_BOLD}  ❯  Confirm passphrase${C_RESET} "
+    stty -echo </dev/tty 2>/dev/null || true
+    read -r GPG_PASS2 </dev/tty 2>/dev/null || true
+    [ -n "$local_stty" ] && stty "$local_stty" </dev/tty 2>/dev/null || true
+    printf "\n"
+    [ "$GPG_PASS" = "$GPG_PASS2" ] || err "Passphrases do not match"
   else
-    # Batch without passphrase protection failed or agent unavailable
-    # Fall back to fully interactive full key generation
-    warn "Batch mode failed — launching interactive key generator"
-    printf "\n"
-    info "Follow the prompts — choose RSA, 4096 bits, 2y expiry"
-    printf "\n"
-    gpg --full-gen-key </dev/tty || err "GPG key creation failed"
+    warn "No passphrase — key will be unprotected"
+  fi
+  unset GPG_PASS2
+
+  # ── Configure gpg-agent for loopback BEFORE starting the agent ──
+  # This is required in WSL / SSH / headless — any env without a
+  # graphical pinentry. Must be done before gpg-agent starts.
+  mkdir -p "$HOME/.gnupg"
+  chmod 700 "$HOME/.gnupg"
+
+  # Write loopback setting
+  touch "$HOME/.gnupg/gpg-agent.conf"
+  if ! grep -q "allow-loopback-pinentry" "$HOME/.gnupg/gpg-agent.conf"; then
+    printf "allow-loopback-pinentry\n" >> "$HOME/.gnupg/gpg-agent.conf"
   fi
 
-  GPG_KEY_ID=$(gpg --list-secret-keys --with-colons "$GPG_EMAIL" 2>/dev/null \
-    | awk -F: '/^fpr/ {print $10; exit}')
+  # Also write gpg.conf to always use loopback
+  touch "$HOME/.gnupg/gpg.conf"
+  if ! grep -q "pinentry-mode" "$HOME/.gnupg/gpg.conf"; then
+    printf "pinentry-mode loopback\n" >> "$HOME/.gnupg/gpg.conf"
+  fi
+
+  # Kill any running agent so it restarts with new config
+  gpgconf --kill gpg-agent 2>/dev/null || true
+  sleep 0.5
+
+  # Set GPG_TTY so curses-based pinentry works as a last resort
+  export GPG_TTY
+  GPG_TTY="$(tty 2>/dev/null)" || GPG_TTY=""
+
+  # ── Build batch file in a temp file ─────────────────────────────
+  _gpg_batch="$(mktemp)"
+  chmod 600 "$_gpg_batch"
+
+  if [ -n "$GPG_PASS" ]; then
+    cat > "$_gpg_batch" <<BATCH
+Key-Type: EDDSA
+Key-Curve: ed25519
+Subkey-Type: ECDH
+Subkey-Curve: cv25519
+Name-Real: ${GPG_NAME}
+Name-Email: ${GPG_EMAIL}
+Expire-Date: 2y
+Passphrase: ${GPG_PASS}
+%commit
+BATCH
+  else
+    cat > "$_gpg_batch" <<BATCH
+Key-Type: EDDSA
+Key-Curve: ed25519
+Subkey-Type: ECDH
+Subkey-Curve: cv25519
+Name-Real: ${GPG_NAME}
+Name-Email: ${GPG_EMAIL}
+Expire-Date: 2y
+%no-protection
+%commit
+BATCH
+  fi
+
+  step "Generating Ed25519 key..."
+  gpg --batch --pinentry-mode loopback --gen-key "$_gpg_batch" 2>&1 \
+    | grep -v "^gpg: key\|^gpg: revocation\|^pub\|^uid" | sed 's/^/  /' || true
+  _gpg_exit="${PIPESTATUS[0]}"
+
+  rm -f "$_gpg_batch"
+  unset GPG_PASS
+
+  [ "$_gpg_exit" -eq 0 ] || err "GPG key generation failed (exit ${_gpg_exit})"
+
+  GPG_KEY_ID="$(gpg --list-secret-keys --with-colons "$GPG_EMAIL" 2>/dev/null \
+    | awk -F: '/^fpr/ {print $10; exit}')"
   [ -n "${GPG_KEY_ID:-}" ] || err "Key created but fingerprint not found"
 
   ok "Key created: ${GPG_KEY_ID:(-16)}"
-  gpg --fingerprint "$GPG_KEY_ID" 2>/dev/null | grep -A1 "pub" | sed 's/^/  /'
+  gpg --fingerprint "$GPG_KEY_ID" 2>/dev/null | sed 's/^/  /'
 
   printf "\n"
   info "Back up your key:"
   dim "  gpg --export-secret-keys --armor $GPG_KEY_ID > passx-backup.asc"
+  dim "  store that file somewhere safe and offline"
 fi
 
 # ════════════════════════════════════════════════════════════════
