@@ -2727,7 +2727,6 @@ _passx() {
       esac ;;
   esac
 }
-_passx
 ZSH
 }
 
@@ -3113,4 +3112,3 @@ case "${1:-}" in
     printf "  ${C_DIM}Run ${C_BOLD}passx --help${C_RESET}${C_DIM} for the full command list${C_RESET}\n\n"
     exit 1 ;;
 esac
-
