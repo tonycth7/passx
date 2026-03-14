@@ -215,68 +215,90 @@ fi
 # ════════════════════════════════════════════════════════════════
 label "Step 3 — Install passx"
 
-# Determine install dir
+# Determine install dir — try /usr/local/bin first, fall back silently
 INSTALL_DIR="/usr/local/bin"
-if ! sudo true 2>/dev/null; then
+if ! sudo -n true 2>/dev/null && ! sudo true 2>/dev/null; then
   INSTALL_DIR="$HOME/.local/bin"
-  mkdir -p "$INSTALL_DIR"
-  warn "No sudo — installing to $INSTALL_DIR"
 fi
+mkdir -p "$HOME/.local/bin"  # always exists as fallback
 
-_fetch_install() {
-  # _fetch_install "url" "dest-name"
-  local url="$1" name="$2" tmp
-  tmp="$(mktemp)"
-  step "Downloading ${name}..."
-  if curl -fsSL "$url" -o "$tmp" 2>/dev/null; then
-    # quick sanity — must start with shebang
-    head -1 "$tmp" | grep -q '^#!' \
-      || { rm -f "$tmp"; warn "Download looks wrong for $name — skipping"; return 1; }
-    if [ "$INSTALL_DIR" = "/usr/local/bin" ]; then
-      sudo install -m 755 "$tmp" "$INSTALL_DIR/$name"
-    else
-      install -m 755 "$tmp" "$INSTALL_DIR/$name"
-    fi
-    rm -f "$tmp"
-    ok "$name  →  $INSTALL_DIR/$name"
+_do_install() {
+  # _do_install "src" "dest-name"  — tries system dir first, falls back to ~/.local/bin
+  local src="$1" name="$2"
+  if sudo install -m 755 "$src" "/usr/local/bin/$name" 2>/dev/null; then
+    INSTALL_DIR="/usr/local/bin"
+    ok "$name  →  /usr/local/bin/$name"
   else
-    rm -f "$tmp"
-    # fallback: look for the file locally (running from a cloned repo)
-    local SCRIPT_DIR
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || pwd)"
-    local found=""
-    for c in "$SCRIPT_DIR/${name}" "$SCRIPT_DIR/${name}.sh" \
-              "$SCRIPT_DIR/passx-1_0.sh" "$SCRIPT_DIR/passx-1.0.sh"; do
-      [ -f "$c" ] && { found="$c"; break; }
-    done
-    if [ -n "$found" ]; then
-      warn "Download failed — using local file: $found"
-      if [ "$INSTALL_DIR" = "/usr/local/bin" ]; then
-        sudo install -m 755 "$found" "$INSTALL_DIR/$name"
-      else
-        install -m 755 "$found" "$INSTALL_DIR/$name"
-      fi
-      ok "$name  →  $INSTALL_DIR/$name  (local)"
-    else
-      warn "Could not download or find $name — install manually"
-      return 1
-    fi
+    install -m 755 "$src" "$HOME/.local/bin/$name"
+    INSTALL_DIR="$HOME/.local/bin"
+    ok "$name  →  $HOME/.local/bin/$name"
   fi
 }
 
-_fetch_install "$PASSX_SCRIPT_URL" "passx" || true
-_fetch_install "$PASSX_MENU_URL"   "passx-menu" || true
+_fetch_install() {
+  # _fetch_install "url" "dest-name"
+  local url="$1" name="$2"
+  local tmp; tmp="$(mktemp)"
+  step "Downloading ${name}..."
 
-# PATH warning
-if [ "$INSTALL_DIR" = "$HOME/.local/bin" ]; then
-  [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]     && warn "~/.local/bin is not in PATH — add to your shell rc:
-    export PATH="\$HOME/.local/bin:\$PATH""
+  local got_file=false
+
+  # Try download
+  if curl -fsSL --retry 2 --retry-delay 1 "$url" -o "$tmp" 2>/dev/null \
+      && head -1 "$tmp" | grep -q '^#!'; then
+    got_file=true
+  else
+    rm -f "$tmp"; tmp="$(mktemp)"
+    # Fallback: look for file next to the install script
+    local sdir
+    sdir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || pwd)"
+    local c
+    for c in "$sdir/${name}" "$sdir/${name}.sh" \
+              "$sdir/passx-1.0.sh" "$sdir/passx-1_0.sh" \
+              "$sdir/passx-menu.sh"; do
+      if [ -f "$c" ] && { [ "$name" = "passx" ] || [[ "$c" == *menu* ]]; }; then
+        cp "$c" "$tmp" && got_file=true && warn "Using local file: $c"
+        break
+      fi
+    done
+    # simpler fallback without the menu check
+    if ! $got_file; then
+      for c in "$sdir/${name}" "$sdir/${name}.sh" \
+                "$sdir/passx-1.0.sh" "$sdir/passx-1_0.sh"; do
+        [ -f "$c" ] && { cp "$c" "$tmp" && got_file=true && warn "Using local: $c"; break; }
+      done
+    fi
+  fi
+
+  if $got_file && [ -s "$tmp" ]; then
+    _do_install "$tmp" "$name"
+  else
+    warn "Could not obtain $name — skipping"
+  fi
+  rm -f "$tmp"
+}
+
+_fetch_install "$PASSX_SCRIPT_URL" "passx"
+_fetch_install "$PASSX_MENU_URL"   "passx-menu"
+
+# PATH warning if landed in ~/.local/bin
+if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+  warn "~/.local/bin is not in PATH — add to your shell rc:
+    export PATH=\"\$HOME/.local/bin:\$PATH\""
 fi
 
-# Full paths to installed binaries — used throughout the rest of the script
-# so PATH doesn't need to be correct yet (e.g. during curl | bash)
-PASSX_BIN="$INSTALL_DIR/passx"
-PASSX_MENU_BIN="$INSTALL_DIR/passx-menu"
+# Resolve actual installed paths — don't rely on INSTALL_DIR since each
+# binary picks its own location independently
+if   [ -x "/usr/local/bin/passx" ];  then PASSX_BIN="/usr/local/bin/passx"
+elif [ -x "$HOME/.local/bin/passx" ]; then PASSX_BIN="$HOME/.local/bin/passx"
+else PASSX_BIN=""; fi
+
+if   [ -x "/usr/local/bin/passx-menu" ];  then PASSX_MENU_BIN="/usr/local/bin/passx-menu"
+elif [ -x "$HOME/.local/bin/passx-menu" ]; then PASSX_MENU_BIN="$HOME/.local/bin/passx-menu"
+else PASSX_MENU_BIN=""; fi
+
+[ -n "$PASSX_BIN" ] && ok "passx found at $PASSX_BIN"   || warn "passx not found after install — something went wrong"
+
 _passx() { "$PASSX_BIN" "$@"; }
 
 # ════════════════════════════════════════════════════════════════
