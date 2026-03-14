@@ -405,6 +405,48 @@ _hook() {
 }
 
 # ════════════════════════════════════════════════════════════════
+# § GPG ENVIRONMENT
+# ════════════════════════════════════════════════════════════════
+# Call before any operation that needs GPG to decrypt/encrypt
+# interactively (edit, rotate, add, otp import, key ops).
+# Fixes: "agent_genkey failed: No such device or address" on WSL,
+# headless, SSH sessions — anywhere pinentry-gtk/qt isn't available.
+_gpg_env() {
+  # Set GPG_TTY so pinentry-curses can find the terminal
+  export GPG_TTY
+  GPG_TTY="$(tty 2>/dev/null)" || GPG_TTY="${GPG_TTY:-}"
+
+  # Ensure ~/.gnupg exists with correct permissions
+  mkdir -p "$HOME/.gnupg"
+  chmod 700 "$HOME/.gnupg"
+
+  local _agentconf="$HOME/.gnupg/gpg-agent.conf"
+  local _gpgconf="$HOME/.gnupg/gpg.conf"
+  local _agent_dirty=false
+
+  # REMOVE pinentry-mode loopback from gpg.conf if present —
+  # it was written by an earlier version of passx and breaks pass edit
+  if grep -q "pinentry-mode" "$_gpgconf" 2>/dev/null; then
+    sed -i "/^pinentry-mode/d" "$_gpgconf"
+    _agent_dirty=true
+  fi
+
+  # Add allow-loopback-pinentry to gpg-agent.conf if missing
+  touch "$_agentconf"
+  if ! grep -q "allow-loopback-pinentry" "$_agentconf" 2>/dev/null; then
+    printf "allow-loopback-pinentry
+" >> "$_agentconf"
+    _agent_dirty=true
+  fi
+
+  # Restart agent only when config changed
+  if $_agent_dirty; then
+    gpgconf --kill gpg-agent 2>/dev/null || true
+    sleep 0.5
+  fi
+}
+
+# ════════════════════════════════════════════════════════════════
 # § GIT / SYNC
 # ════════════════════════════════════════════════════════════════
 _need_git() {
@@ -507,6 +549,7 @@ cmd_add() {
     [ -n "$email" ]  && printf "email: %s\n"    "$email"
     [ -n "$user"  ]  && printf "username: %s\n" "$user"
     [ -n "$notes" ]  && printf "notes: %s\n"    "$notes"
+  _gpg_env
   } | pass insert -m -f "$path" 2>/dev/null; true
 
   # pass insert returns non-zero even on success in some versions —
@@ -892,6 +935,7 @@ cmd_set_field() {
   local entry; entry="$(pass show "$path" 2>/dev/null)" || err "Entry not found: $path"
   local tmp; tmp="$(mktemp)"
 
+  _gpg_env
   if [ "$field" = "password" ]; then
     { printf "%s\n" "$value"; printf "%s\n" "$(printf "%s\n" "$entry" | tail -n +2)"; } \
       | pass insert -m -f "$path" || { rm -f "$tmp"; err "pass insert failed"; }
@@ -966,7 +1010,8 @@ cmd_note() {
     edit)
       [ -z "$path" ] && path="$(list_entries | _fzf_pick "note" "Select entry to edit")" || true
       [ -z "${path:-}" ] && err "No entry selected"
-      env EDITOR="${EDITOR:-${VISUAL:-vim}}" pass edit "$path"; _autosync ;;
+      _gpg_env
+      env EDITOR="${EDITOR:-${VISUAL:-nvim}}" GPG_TTY="$GPG_TTY" pass edit "$path"; _autosync ;;
     copy)
       [ -z "$path" ] && path="$(list_entries | _fzf_pick "note" "Select entry")" || true
       [ -z "${path:-}" ] && err "No entry selected"
@@ -1529,6 +1574,7 @@ cmd_rotate() {
   local newpw rest
   newpw="$(gen_password "$length")"
   rest="$(pass show "$path" | tail -n +2)"
+  _gpg_env
   { printf "%s\n" "$newpw"; printf "%s\n" "$rest"; } | pass insert -m -f "$path" \
     || err "Rotate failed"
   printf "%s" "$newpw" | copy_clipboard --silent || true
@@ -1559,11 +1605,13 @@ cmd_edit() {
   [ -z "$path" ] && path="$(list_entries | _fzf_pick "edit" "Select entry to edit")" || true
   [ -z "${path:-}" ] && err "Usage: passx edit <path>"
   local editor="${EDITOR:-${VISUAL:-}}"
-  [ -z "$editor" ] && for e in vim vi nano; do
+  [ -z "$editor" ] && for e in nvim vim vi nano; do
     command -v "$e" >/dev/null 2>&1 && { editor="$e"; break; }
   done
-  [ -z "${editor:-}" ] && err "No editor found — set \$EDITOR"
-  env EDITOR="$editor" pass edit "$path" || err "Edit failed"
+  [ -z "${editor:-}" ] && err "No editor found — set \$EDITOR  (e.g.: export EDITOR=nvim)"
+  _gpg_env
+  env EDITOR="$editor" GPG_TTY="$GPG_TTY" \
+      pass edit "$path" || err "Edit failed — check GPG key and pinentry setup"
   _hook post-edit "$path"
   _autosync
 }
