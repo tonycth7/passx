@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/tonycth7/passx/main/install.sh | ba
 ```
 
 the installer handles everything — dependencies, GPG key setup, SSH key, git remote, shell completions. it detects your package manager (apt, pacman, dnf, brew) and asks before touching anything.
-  Or
+  ##Or
 ```sh
 git clone https://github.com/you/passx
 cd passx
@@ -25,8 +25,7 @@ chmod +x native-install.sh
 bash native-install.sh
 ```
  for Native-install if you clone the Repo 
-the install script handles dependencies, detects your package manager, fetches GPG keys, and walks you through `pass init` interactively.
-
+ 
 
 ---
 
