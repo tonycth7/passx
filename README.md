@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/tonycth7/passx/main/install.sh | ba
 ```
 
 the installer handles everything — dependencies, GPG key setup, SSH key, git remote, shell completions. it detects your package manager (apt, pacman, dnf, brew) and asks before touching anything.
-  ##Or
+###Or
 ```sh
 git clone https://github.com/you/passx
 cd passx
