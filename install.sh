@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+ #!/usr/bin/env bash
 # ╔════════════════════════════════════════════════════════════════╗
 # ║  passx installer  —  setup passx + pass + GPG                 ║
 # ║                                                                ║
@@ -6,6 +6,10 @@
 # ║  curl -fsSL https://raw.githubusercontent.com/tonycth7/passx/main/install.sh | bash
 # ╚════════════════════════════════════════════════════════════════╝
 set -euo pipefail
+
+# ── Never let git prompt for passwords — SSH only ─────────────
+export GIT_TERMINAL_PROMPT=0
+export GIT_SSH_COMMAND="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
 
 # ── Repo — change these if you fork ──────────────────────────────
 PASSX_REPO_BASE="https://raw.githubusercontent.com/tonycth7/passx/main"
@@ -26,6 +30,21 @@ info()  { printf "  ${C_CYAN}ℹ  %s${C_RESET}\n" "$*"; }
 step()  { printf "\n${C_BLUE}  →  %s${C_RESET}\n" "$*"; }
 dim()   { printf "  ${C_DIM}%s${C_RESET}\n" "$*"; }
 ask()   { printf "\n${C_MAGENTA}${C_BOLD}  ❯  %s${C_RESET} " "$*"; }
+
+# Robust TTY read — retries until non-empty or max attempts reached.
+# Usage: _read_tty VAR "prompt text"
+_read_tty() {
+  local _var="$1" _prompt="$2" _val="" _try=0 _max=5
+  while [ -z "$_val" ] && [ $_try -lt $_max ]; do
+    ask "$_prompt"
+    IFS= read -r _val </dev/tty 2>/dev/null || _val=""
+    # strip leading/trailing whitespace
+    _val="${_val#"${_val%%[![:space:]]*}"}"
+    _val="${_val%"${_val##*[![:space:]]}"}"
+    [ -z "$_val" ] && (( _try++ )) && [ $_try -lt $_max ] && warn "Cannot be empty, please try again"
+  done
+  printf -v "$_var" '%s' "$_val"
+}
 label() {
   printf "\n  ${C_BOLD}${C_CYAN}%s${C_RESET}\n  ${C_DIM}"
   printf '─%.0s' $(seq 1 $(( ${#1} + 2 )))
@@ -388,12 +407,11 @@ fi
 if [ "$GPG_KEY_ID" = "__CREATE__" ]; then
   printf "\n  ${C_BOLD}New GPG key${C_RESET}\n\n"
 
-  ask "Your name"
-  read -r GPG_NAME </dev/tty 2>/dev/null || GPG_NAME=""
+  local GPG_NAME="" GPG_EMAIL=""
+  _read_tty GPG_NAME "Your name"
   [ -z "$GPG_NAME" ] && err "Name cannot be empty"
 
-  ask "Your email"
-  read -r GPG_EMAIL </dev/tty 2>/dev/null || GPG_EMAIL=""
+  _read_tty GPG_EMAIL "Your email"
   [[ "$GPG_EMAIL" == *@* ]] || err "Invalid email"
 
   # Read passphrase directly in the terminal with echo off
@@ -519,25 +537,22 @@ _pick_ssh_url() {
     GitLab*)      host_domain="gitlab.com" ;;
     Codeberg*)    host_domain="codeberg.org" ;;
     "Gitea"*|"Other"*)
-      ask "SSH hostname  (e.g. git.example.com)"
-      read -r host_domain </dev/tty 2>/dev/null || host_domain=""
+      _read_tty host_domain "SSH hostname  (e.g. git.example.com)"
       [ -z "$host_domain" ] && { warn "No hostname given"; return 1; } ;;
   esac
 
   case "$host_label" in
     "Other self-hosted"*)
       # Full URL mode
-      ask "Full SSH URL  (e.g. git@git.example.com:user/passwords.git)"
-      read -r GIT_REMOTE_URL </dev/tty 2>/dev/null || GIT_REMOTE_URL=""
+      _read_tty GIT_REMOTE_URL "Full SSH URL  (e.g. git@git.example.com:user/passwords.git)"
       [ -z "$GIT_REMOTE_URL" ] && { warn "No URL given"; return 1; }
       ;;
     *)
-      ask "Username / org  (your git account name)"
-      local git_user; read -r git_user </dev/tty 2>/dev/null || git_user=""
+      local git_user="" git_repo=""
+      _read_tty git_user "Username / org  (your GitHub/GitLab username)"
       [ -z "$git_user" ] && { warn "Username cannot be empty"; return 1; }
 
-      ask "Repository name  (e.g. passwords)"
-      local git_repo; read -r git_repo </dev/tty 2>/dev/null || git_repo=""
+      _read_tty git_repo "Repository name  (e.g. passwords)"
       [ -z "$git_repo" ] && { warn "Repo name cannot be empty"; return 1; }
 
       # Strip .git suffix if provided, then re-add it cleanly
@@ -565,23 +580,41 @@ _test_ssh() {
   [ -z "$host" ] && return 0  # can't parse — skip test
 
   step "Testing SSH connection to ${host}..."
-  if ssh -T -o ConnectTimeout=6 -o StrictHostKeyChecking=accept-new          -o BatchMode=yes "git@${host}" 2>&1 | grep -qiE 'success|welcome|authenticated|hi '; then
+  local ssh_out ssh_rc=0
+  ssh_out="$(ssh -T -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+    -o BatchMode=yes "git@${host}" 2>&1)" || ssh_rc=$?
+
+  if printf "%s" "$ssh_out" | grep -qiE 'success|welcome|authenticated|hi '; then
     ok "SSH connection works"
     return 0
-  else
-    # exit code 1 from github/gitlab is normal (no shell access) but still authenticated
-    # only fail on connection refused / timeout / host unreachable
-    local ssh_out
-    ssh_out="$(ssh -T -o ConnectTimeout=6 -o BatchMode=yes "git@${host}" 2>&1 || true)"
-    if printf "%s" "$ssh_out" | grep -qiE 'refused|timeout|unreachable|no route|could not resolve'; then
-      warn "SSH connection failed — cannot reach ${host}"
-      warn "Check: is your SSH key added to ${host}? Is the host reachable?"
-      printf "
-"
-      confirm "Continue anyway?" || return 1
-    else
-      ok "SSH reachable (${host})"
+  elif printf "%s" "$ssh_out" | grep -qiE 'publickey|Permission denied'; then
+    warn "SSH key not accepted by ${host}"
+    printf "\n"
+    info "Your SSH public key needs to be added to ${host}:"
+    for _pub in "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_rsa.pub"; do
+      [ -f "$_pub" ] && { cat "$_pub" | sed 's/^/    /'; break; }
+    done
+    if ! [ -f "$HOME/.ssh/id_ed25519" ] && ! [ -f "$HOME/.ssh/id_rsa" ]; then
+      warn "No SSH key found at all — generate one first:"
+      dim "  ssh-keygen -t ed25519 -C your@email.com"
     fi
+    printf "\n"
+    dim "Then add it at:"
+    case "$host" in
+      *github*)  dim "  https://github.com/settings/ssh/new" ;;
+      *gitlab*)  dim "  https://gitlab.com/-/profile/keys" ;;
+      *)         dim "  your git host SSH key settings" ;;
+    esac
+    printf "\n"
+    confirm "Continue anyway (clone will fail if key isn't added)?" || return 1
+    return 0
+  elif printf "%s" "$ssh_out" | grep -qiE 'refused|timeout|unreachable|no route|could not resolve'; then
+    warn "Cannot reach ${host} — check your network"
+    confirm "Continue anyway?" || return 1
+    return 0
+  else
+    # GitHub/GitLab return exit 1 even on success (no shell access) — treat as OK
+    ok "SSH reachable (${host})"
     return 0
   fi
 }
