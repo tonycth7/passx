@@ -1,4 +1,4 @@
- #!/usr/bin/env bash
+#!/usr/bin/env bash
 # ╔════════════════════════════════════════════════════════════════╗
 # ║  passx installer  —  setup passx + pass + GPG                 ║
 # ║                                                                ║
@@ -10,6 +10,9 @@ set -euo pipefail
 # ── Never let git prompt for passwords — SSH only ─────────────
 export GIT_TERMINAL_PROMPT=0
 export GIT_SSH_COMMAND="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
+
+# Global — set by _select_ssh_key(), used by _test_ssh and git clone
+SELECTED_SSH_KEY=""
 
 # ── Repo — change these if you fork ──────────────────────────────
 PASSX_REPO_BASE="https://raw.githubusercontent.com/tonycth7/passx/main"
@@ -31,19 +34,70 @@ step()  { printf "\n${C_BLUE}  →  %s${C_RESET}\n" "$*"; }
 dim()   { printf "  ${C_DIM}%s${C_RESET}\n" "$*"; }
 ask()   { printf "\n${C_MAGENTA}${C_BOLD}  ❯  %s${C_RESET} " "$*"; }
 
-# Robust TTY read — retries until non-empty or max attempts reached.
+# Robust TTY read — retries until non-empty (up to 5 times).
 # Usage: _read_tty VAR "prompt text"
 _read_tty() {
   local _var="$1" _prompt="$2" _val="" _try=0 _max=5
   while [ -z "$_val" ] && [ $_try -lt $_max ]; do
     ask "$_prompt"
     IFS= read -r _val </dev/tty 2>/dev/null || _val=""
-    # strip leading/trailing whitespace
     _val="${_val#"${_val%%[![:space:]]*}"}"
     _val="${_val%"${_val##*[![:space:]]}"}"
     [ -z "$_val" ] && (( _try++ )) && [ $_try -lt $_max ] && warn "Cannot be empty, please try again"
   done
   printf -v "$_var" '%s' "$_val"
+}
+
+# Scan ~/.ssh for all private keys (paired .pub or PRIVATE KEY header).
+# Sets SELECTED_SSH_KEY and updates GIT_SSH_COMMAND to -i <keyfile>.
+_select_ssh_key() {
+  local -a found_keys=()
+  local f
+  for f in "$HOME/.ssh"/*; do
+    [ -f "$f" ] || continue
+    [[ "$f" == *.pub ]] && continue
+    [[ "$f" == */known_hosts* || "$f" == */authorized_keys* || "$f" == */config ]] && continue
+    if head -1 "$f" 2>/dev/null | grep -q "PRIVATE KEY"; then
+      found_keys+=("$f")
+    elif [ -f "${f}.pub" ]; then
+      found_keys+=("$f")
+    fi
+  done
+
+  if [ ${#found_keys[@]} -eq 0 ]; then
+    SELECTED_SSH_KEY=""
+    return 1
+  fi
+
+  if [ ${#found_keys[@]} -eq 1 ]; then
+    SELECTED_SSH_KEY="${found_keys[0]}"
+    info "Using SSH key: ${C_BOLD}$(basename "$SELECTED_SSH_KEY")${C_RESET}  (${SELECTED_SSH_KEY})"
+  else
+    printf "\n  ${C_BOLD}${C_CYAN}Multiple SSH keys found:${C_RESET}\n\n"
+    local i=1
+    for f in "${found_keys[@]}"; do
+      local pub="${f}.pub"
+      local comment=""
+      [ -f "$pub" ] && comment="  ${C_DIM}$(awk '{print $3}' "$pub" 2>/dev/null)${C_RESET}"
+      printf "    ${C_CYAN}[%d]${C_RESET}  %-30s%b\n" "$i" "$(basename "$f")" "$comment"
+      (( i++ ))
+    done
+    printf "\n"
+    local choice=""
+    while true; do
+      ask "Which key to use? (1-${#found_keys[@]})"
+      read -r choice </dev/tty 2>/dev/null || choice=""
+      if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#found_keys[@]} )); then
+        SELECTED_SSH_KEY="${found_keys[$((choice-1))]}"
+        break
+      fi
+      warn "Enter a number between 1 and ${#found_keys[@]}"
+    done
+    info "Using SSH key: ${C_BOLD}$(basename "$SELECTED_SSH_KEY")${C_RESET}"
+  fi
+
+  export GIT_SSH_COMMAND="ssh -i \"$SELECTED_SSH_KEY\" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o IdentitiesOnly=yes"
+  return 0
 }
 label() {
   printf "\n  ${C_BOLD}${C_CYAN}%s${C_RESET}\n  ${C_DIM}"
@@ -543,7 +597,6 @@ _pick_ssh_url() {
 
   case "$host_label" in
     "Other self-hosted"*)
-      # Full URL mode
       _read_tty GIT_REMOTE_URL "Full SSH URL  (e.g. git@git.example.com:user/passwords.git)"
       [ -z "$GIT_REMOTE_URL" ] && { warn "No URL given"; return 1; }
       ;;
@@ -570,40 +623,55 @@ _pick_ssh_url() {
 # ── Helper: test SSH connection ───────────────────────────────
 _test_ssh() {
   local url="$1"
-  # extract host from git@host:path or ssh://git@host/path
   local host
   if [[ "$url" == ssh://* ]]; then
     host="$(printf "%s" "$url" | sed 's|ssh://[^@]*@||; s|/.*||')"
   else
     host="$(printf "%s" "$url" | sed 's/.*@//; s/:.*//')"
   fi
-  [ -z "$host" ] && return 0  # can't parse — skip test
+  [ -z "$host" ] && return 0
 
-  step "Testing SSH connection to ${host}..."
+  # ── Detect / select SSH key before testing ──────────────────
+  if [ -z "$SELECTED_SSH_KEY" ]; then
+    if ! _select_ssh_key; then
+      printf "\n"
+      warn "No SSH key found in ~/.ssh/"
+      if confirm "Generate a new ed25519 SSH key now?"; then
+        local _ssh_email=""
+        _read_tty _ssh_email "Email for SSH key"
+        ssh-keygen -t ed25519 -C "$_ssh_email" -f "$HOME/.ssh/id_ed25519" </dev/tty \
+          && ok "SSH key created: ~/.ssh/id_ed25519" \
+          && _select_ssh_key \
+          || warn "ssh-keygen failed"
+      fi
+      [ -z "$SELECTED_SSH_KEY" ] && { confirm "Continue anyway (clone will fail)?" || return 1; return 0; }
+    fi
+  fi
+
+  step "Testing SSH connection to ${host} using $(basename "$SELECTED_SSH_KEY")..."
   local ssh_out ssh_rc=0
-  ssh_out="$(ssh -T -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
-    -o BatchMode=yes "git@${host}" 2>&1)" || ssh_rc=$?
+  ssh_out="$(ssh -T \
+    -i "$SELECTED_SSH_KEY" \
+    -o BatchMode=yes \
+    -o StrictHostKeyChecking=accept-new \
+    -o ConnectTimeout=10 \
+    -o IdentitiesOnly=yes \
+    "git@${host}" 2>&1)" || ssh_rc=$?
 
   if printf "%s" "$ssh_out" | grep -qiE 'success|welcome|authenticated|hi '; then
-    ok "SSH connection works"
+    ok "SSH auth OK  (${host})"
     return 0
   elif printf "%s" "$ssh_out" | grep -qiE 'publickey|Permission denied'; then
     warn "SSH key not accepted by ${host}"
     printf "\n"
-    info "Your SSH public key needs to be added to ${host}:"
-    for _pub in "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_rsa.pub"; do
-      [ -f "$_pub" ] && { cat "$_pub" | sed 's/^/    /'; break; }
-    done
-    if ! [ -f "$HOME/.ssh/id_ed25519" ] && ! [ -f "$HOME/.ssh/id_rsa" ]; then
-      warn "No SSH key found at all — generate one first:"
-      dim "  ssh-keygen -t ed25519 -C your@email.com"
-    fi
+    info "The public key below needs to be added to ${host}:"
+    [ -f "${SELECTED_SSH_KEY}.pub" ] && cat "${SELECTED_SSH_KEY}.pub" | sed 's/^/    /'
     printf "\n"
-    dim "Then add it at:"
     case "$host" in
-      *github*)  dim "  https://github.com/settings/ssh/new" ;;
-      *gitlab*)  dim "  https://gitlab.com/-/profile/keys" ;;
-      *)         dim "  your git host SSH key settings" ;;
+      *github*)   dim "  → https://github.com/settings/ssh/new" ;;
+      *gitlab*)   dim "  → https://gitlab.com/-/profile/keys" ;;
+      *codeberg*) dim "  → https://codeberg.org/user/settings/keys" ;;
+      *)          dim "  → your git host SSH key settings page" ;;
     esac
     printf "\n"
     confirm "Continue anyway (clone will fail if key isn't added)?" || return 1
@@ -613,7 +681,6 @@ _test_ssh() {
     confirm "Continue anyway?" || return 1
     return 0
   else
-    # GitHub/GitLab return exit 1 even on success (no shell access) — treat as OK
     ok "SSH reachable (${host})"
     return 0
   fi
@@ -809,31 +876,86 @@ if [ -d "${STORE_DIR:-$HOME/.password-store}" ]     && [ -f "${STORE_DIR:-$HOME/
   pass git init 2>/dev/null && ok "git initialized" || warn "pass git init failed"
 fi
 
-# SSH key hint — only relevant when a new remote was configured
-# If the user just cloned successfully they obviously have an SSH key already
+# SSH key reminder — only when we set up a remote but didn't clone
 if [ "${GIT_REMOTE_URL:-}" != "" ] && ! $STORE_CLONED; then
-  # We just set up a new remote — show/generate SSH key for the host
-  if [ -f "$HOME/.ssh/id_ed25519.pub" ] || [ -f "$HOME/.ssh/id_rsa.pub" ]; then
+  if [ -n "$SELECTED_SSH_KEY" ] && [ -f "${SELECTED_SSH_KEY}.pub" ]; then
     printf "\n"
-    info "Your SSH public key — paste this into your git host if not done yet:"
-    for _pub in "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_rsa.pub"; do
-      [ -f "$_pub" ] && { cat "$_pub" | sed 's/^/  /'; break; }
-    done
-  elif ! [ -f "$HOME/.ssh/id_ed25519" ] && ! [ -f "$HOME/.ssh/id_rsa" ]; then
+    info "SSH public key for ${GIT_REMOTE_URL%%:*} — paste this if not already added:"
+    cat "${SELECTED_SSH_KEY}.pub" | sed 's/^/  /'
+  elif [ -z "$SELECTED_SSH_KEY" ]; then
     printf "\n"
-    warn "No SSH key found — you need one to push/pull from a private git repo"
-    if confirm "Generate an SSH key now?"; then
-      ask "Email for SSH key"
-      _ssh_email=""; read -r _ssh_email </dev/tty 2>/dev/null || _ssh_email="passx@local"
-      ssh-keygen -t ed25519 -C "$_ssh_email" -f "$HOME/.ssh/id_ed25519" </dev/tty         && ok "SSH key created: ~/.ssh/id_ed25519"         && { printf "\n"; info "Add this to your git host:";              cat "$HOME/.ssh/id_ed25519.pub" | sed 's/^/  /'; }         || warn "ssh-keygen failed"
-    fi
+    warn "No SSH key found — generate one and add it to your git host before pushing:"
+    dim "  ssh-keygen -t ed25519 -C your@email.com"
   fi
 fi
 
 # ════════════════════════════════════════════════════════════════
-#   STEP 6 — CONFIG  (auto-generate if missing)
+#   STEP 6 — GIT IDENTITY  (required for commits / passx sync)
 # ════════════════════════════════════════════════════════════════
-label "Step 6 — Configuration"
+label "Step 6 — Git identity"
+
+printf "  ${C_DIM}pass records every change as a git commit.\n"
+printf "  Without a name + email git silently skips commits,\n"
+printf "  so passx sync appears to work but nothing is saved.${C_RESET}\n\n"
+
+_GIT_NAME="$(git config --global user.name  2>/dev/null || true)"
+_GIT_EMAIL="$(git config --global user.email 2>/dev/null || true)"
+
+if [ -n "$_GIT_NAME" ] && [ -n "$_GIT_EMAIL" ]; then
+  ok "Git identity already set"
+  dim "  name  : $_GIT_NAME"
+  dim "  email : $_GIT_EMAIL"
+else
+  if [ -z "$_GIT_NAME" ] && [ -z "$_GIT_EMAIL" ]; then
+    warn "Git identity not set (no user.name or user.email)"
+  elif [ -z "$_GIT_NAME" ]; then
+    warn "Git user.name is not set  (user.email is: $_GIT_EMAIL)"
+  else
+    warn "Git user.email is not set  (user.name is: $_GIT_NAME)"
+  fi
+  printf "\n"
+
+  # Pre-fill from GPG key if we just created one
+  _default_name="${GPG_NAME:-}"
+  _default_email="${GPG_EMAIL:-}"
+
+  if [ -z "$_GIT_NAME" ]; then
+    if [ -n "$_default_name" ]; then
+      ask "Your name  [${_default_name}]"
+      IFS= read -r _GIT_NAME </dev/tty 2>/dev/null || _GIT_NAME=""
+      _GIT_NAME="${_GIT_NAME:-$_default_name}"
+    else
+      _read_tty _GIT_NAME "Your name"
+    fi
+  fi
+
+  if [ -z "$_GIT_EMAIL" ]; then
+    if [ -n "$_default_email" ]; then
+      ask "Your email  [${_default_email}]"
+      IFS= read -r _GIT_EMAIL </dev/tty 2>/dev/null || _GIT_EMAIL=""
+      _GIT_EMAIL="${_GIT_EMAIL:-$_default_email}"
+    else
+      _read_tty _GIT_EMAIL "Your email"
+    fi
+  fi
+
+  if [ -n "$_GIT_NAME" ] && [ -n "$_GIT_EMAIL" ]; then
+    git config --global user.name  "$_GIT_NAME"
+    git config --global user.email "$_GIT_EMAIL"
+    ok "Git identity saved"
+    dim "  name  : $_GIT_NAME"
+    dim "  email : $_GIT_EMAIL"
+  else
+    warn "Skipped — git commits will be anonymous until you run:"
+    dim "  git config --global user.name  \"Your Name\""
+    dim "  git config --global user.email \"you@example.com\""
+  fi
+fi
+
+# ════════════════════════════════════════════════════════════════
+#   STEP 7 — CONFIG  (auto-generate if missing)
+# ════════════════════════════════════════════════════════════════
+label "Step 7 — Configuration"
 
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/passx"
 CONF_FILE="$CONF_DIR/passx.conf"
@@ -864,7 +986,7 @@ CONF
 fi
 
 # ════════════════════════════════════════════════════════════════
-#   STEP 7 — COMPLETIONS  (write to file, not source <())
+#   STEP 8 — COMPLETIONS  (write to file, not source <())
 # ════════════════════════════════════════════════════════════════
 label "Step 7 — Shell completions"
 
