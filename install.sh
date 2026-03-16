@@ -7,11 +7,10 @@
 # ╚════════════════════════════════════════════════════════════════╝
 set -euo pipefail
 
-# ── Never let git prompt for passwords — SSH only ─────────────
+# ── Never let git fall back to password auth ──────────────────
 export GIT_TERMINAL_PROMPT=0
-export GIT_SSH_COMMAND="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
 
-# Global — set by _select_ssh_key(), used by _test_ssh and git clone
+# Globals set by _select_ssh_key() / _load_ssh_key()
 SELECTED_SSH_KEY=""
 
 # ── Repo — change these if you fork ──────────────────────────────
@@ -35,7 +34,6 @@ dim()   { printf "  ${C_DIM}%s${C_RESET}\n" "$*"; }
 ask()   { printf "\n${C_MAGENTA}${C_BOLD}  ❯  %s${C_RESET} " "$*"; }
 
 # Robust TTY read — retries until non-empty (up to 5 times).
-# Usage: _read_tty VAR "prompt text"
 _read_tty() {
   local _var="$1" _prompt="$2" _val="" _try=0 _max=5
   while [ -z "$_val" ] && [ $_try -lt $_max ]; do
@@ -49,7 +47,7 @@ _read_tty() {
 }
 
 # Scan ~/.ssh for all private keys (paired .pub or PRIVATE KEY header).
-# Sets SELECTED_SSH_KEY and updates GIT_SSH_COMMAND to -i <keyfile>.
+# Auto-creates .pub if missing. Sets SELECTED_SSH_KEY.
 _select_ssh_key() {
   local -a found_keys=()
   local f
@@ -71,14 +69,12 @@ _select_ssh_key() {
 
   if [ ${#found_keys[@]} -eq 1 ]; then
     SELECTED_SSH_KEY="${found_keys[0]}"
-    info "Using SSH key: ${C_BOLD}$(basename "$SELECTED_SSH_KEY")${C_RESET}  (${SELECTED_SSH_KEY})"
   else
     printf "\n  ${C_BOLD}${C_CYAN}Multiple SSH keys found:${C_RESET}\n\n"
     local i=1
     for f in "${found_keys[@]}"; do
-      local pub="${f}.pub"
       local comment=""
-      [ -f "$pub" ] && comment="  ${C_DIM}$(awk '{print $3}' "$pub" 2>/dev/null)${C_RESET}"
+      [ -f "${f}.pub" ] && comment="  ${C_DIM}$(awk '{print $3}' "${f}.pub" 2>/dev/null)${C_RESET}"
       printf "    ${C_CYAN}[%d]${C_RESET}  %-30s%b\n" "$i" "$(basename "$f")" "$comment"
       (( i++ ))
     done
@@ -93,11 +89,63 @@ _select_ssh_key() {
       fi
       warn "Enter a number between 1 and ${#found_keys[@]}"
     done
-    info "Using SSH key: ${C_BOLD}$(basename "$SELECTED_SSH_KEY")${C_RESET}"
   fi
 
-  export GIT_SSH_COMMAND="ssh -i \"$SELECTED_SSH_KEY\" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o IdentitiesOnly=yes"
+  info "Using SSH key: ${C_BOLD}$(basename "$SELECTED_SSH_KEY")${C_RESET}  (${SELECTED_SSH_KEY})"
+
+  # ── Auto-create .pub if missing ──────────────────────────────
+  if [ ! -f "${SELECTED_SSH_KEY}.pub" ]; then
+    step "No .pub file — extracting public key from $(basename "$SELECTED_SSH_KEY")..."
+    printf "  ${C_DIM}(enter passphrase if the key is protected)${C_RESET}\n"
+    if ssh-keygen -y -f "$SELECTED_SSH_KEY" > "${SELECTED_SSH_KEY}.pub" </dev/tty 2>/dev/null; then
+      ok "Created ${SELECTED_SSH_KEY}.pub"
+    else
+      rm -f "${SELECTED_SSH_KEY}.pub"
+      warn "Could not extract public key (wrong passphrase?)"
+    fi
+  fi
+
   return 0
+}
+
+# Load the selected key into ssh-agent (prompts passphrase once, cached after).
+# Once loaded, plain `ssh` / `git` picks it up automatically — no wrapper needed.
+_load_ssh_key() {
+  [ -z "$SELECTED_SSH_KEY" ] && return 1
+
+  # Start agent if not running
+  if [ -z "${SSH_AUTH_SOCK:-}" ] || ! ssh-add -l >/dev/null 2>&1; then
+    step "Starting ssh-agent..."
+    eval "$(ssh-agent -s 2>/dev/null)" >/dev/null
+  fi
+
+  # Already loaded?
+  local key_fp
+  key_fp="$(ssh-keygen -lf "$SELECTED_SSH_KEY" 2>/dev/null | awk '{print $2}')" || true
+  if [ -n "$key_fp" ] && ssh-add -l 2>/dev/null | grep -qF "$key_fp"; then
+    ok "Key already in agent — no passphrase needed"
+    return 0
+  fi
+
+  step "Loading $(basename "$SELECTED_SSH_KEY") into ssh-agent..."
+  printf "  ${C_DIM}Enter passphrase once — it will be cached for the rest of this install.${C_RESET}\n"
+  printf "  ${C_DIM}Just press Enter if the key has no passphrase.${C_RESET}\n\n"
+
+  local attempts=0
+  while [ $attempts -lt 3 ]; do
+    # ssh-add reads passphrase from the TTY directly
+    if SSH_ASKPASS="" ssh-add "$SELECTED_SSH_KEY" </dev/tty 2>&1; then
+      ok "Key loaded — git will now authenticate silently"
+      # Point GIT_SSH_COMMAND at plain ssh using the agent — no -i, no IdentitiesOnly
+      export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes"
+      return 0
+    fi
+    (( attempts++ ))
+    [ $attempts -lt 3 ] && warn "Wrong passphrase — try again (attempt $((attempts+1))/3)"
+  done
+
+  warn "Could not load key after 3 attempts — clone will likely fail"
+  return 1
 }
 label() {
   printf "\n  ${C_BOLD}${C_CYAN}%s${C_RESET}\n  ${C_DIM}"
@@ -461,7 +509,7 @@ fi
 if [ "$GPG_KEY_ID" = "__CREATE__" ]; then
   printf "\n  ${C_BOLD}New GPG key${C_RESET}\n\n"
 
-  local GPG_NAME="" GPG_EMAIL=""
+  GPG_NAME="" GPG_EMAIL=""
   _read_tty GPG_NAME "Your name"
   [ -z "$GPG_NAME" ] && err "Name cannot be empty"
 
@@ -631,7 +679,7 @@ _test_ssh() {
   fi
   [ -z "$host" ] && return 0
 
-  # ── Detect / select SSH key before testing ──────────────────
+  # Select key if not done yet
   if [ -z "$SELECTED_SSH_KEY" ]; then
     if ! _select_ssh_key; then
       printf "\n"
@@ -648,14 +696,20 @@ _test_ssh() {
     fi
   fi
 
-  step "Testing SSH connection to ${host} using $(basename "$SELECTED_SSH_KEY")..."
+  # Load into agent — passphrase entered once here, cached for all subsequent ops
+  _load_ssh_key || {
+    warn "Key not loaded into agent — clone may fail"
+    confirm "Continue anyway?" || return 1
+    return 0
+  }
+
+  step "Testing SSH connection to ${host}..."
+  # Test using the agent — same way git clone will authenticate
   local ssh_out ssh_rc=0
   ssh_out="$(ssh -T \
-    -i "$SELECTED_SSH_KEY" \
-    -o BatchMode=yes \
     -o StrictHostKeyChecking=accept-new \
     -o ConnectTimeout=10 \
-    -o IdentitiesOnly=yes \
+    -o BatchMode=yes \
     "git@${host}" 2>&1)" || ssh_rc=$?
 
   if printf "%s" "$ssh_out" | grep -qiE 'success|welcome|authenticated|hi '; then
@@ -664,7 +718,7 @@ _test_ssh() {
   elif printf "%s" "$ssh_out" | grep -qiE 'publickey|Permission denied'; then
     warn "SSH key not accepted by ${host}"
     printf "\n"
-    info "The public key below needs to be added to ${host}:"
+    info "Add this public key to ${host}:"
     [ -f "${SELECTED_SSH_KEY}.pub" ] && cat "${SELECTED_SSH_KEY}.pub" | sed 's/^/    /'
     printf "\n"
     case "$host" in
@@ -773,51 +827,68 @@ else
     "Yes"*)
       # ── Clone existing store ─────────────────────────────
       label "Cloning existing store"
-      printf "  ${C_DIM}Your store will be cloned into: ${C_BOLD}$STORE_DIR${C_RESET}
+      printf "  ${C_DIM}Your store will be cloned into: ${C_BOLD}$STORE_DIR${C_RESET}\n\n"
 
-"
-
-      GIT_REMOTE_URL=""
-      if ! _pick_ssh_url; then
-        warn "URL setup cancelled — skipping clone"
-      else
-        if _test_ssh "$GIT_REMOTE_URL"; then
-          # Make sure target dir is clear
-          if [ -d "$STORE_DIR" ] && [ -n "$(ls -A "$STORE_DIR" 2>/dev/null)" ]; then
-            warn "$STORE_DIR already exists and is not empty"
-            confirm "Remove it and clone fresh?"               && { rm -rf "$STORE_DIR"; step "Removed $STORE_DIR"; }               || { warn "Skipping clone — directory not empty"; }
-          fi
-
-          if [ ! -d "$STORE_DIR" ] || [ -z "$(ls -A "$STORE_DIR" 2>/dev/null)" ]; then
-            step "Cloning $GIT_REMOTE_URL ..."
-            if git clone "$GIT_REMOTE_URL" "$STORE_DIR" 2>&1; then
-              ok "Cloned to $STORE_DIR"
-              STORE_CLONED=true
-
-              # Verify it looks like a pass store
-              if [ -f "$STORE_DIR/.gpg-id" ]; then
-                local_id="$(cat "$STORE_DIR/.gpg-id" 2>/dev/null | head -1)"
-                info "Store GPG ID: $local_id"
-                if [ -n "${GPG_KEY_ID:-}" ] && [ "${GPG_KEY_ID:-}" != "__SKIP__" ]                     && [ "$local_id" != "$GPG_KEY_ID" ]; then
-                  warn "Store was encrypted with a different key: $local_id"
-                  warn "Make sure you have that key imported, or entries won't decrypt"
-                fi
-              else
-                warn "Cloned repo has no .gpg-id — may not be a valid pass store"
-                dim "Run: pass init <your-gpg-key-id>  inside $STORE_DIR"
-              fi
-            else
-              warn "Clone failed"
-              dim "Common causes:"
-              dim "  • SSH key not added to the git host"
-              dim "  • Wrong username or repo name"
-              dim "  • Host not reachable"
-              dim ""
-              dim "Manual clone: git clone $GIT_REMOTE_URL $STORE_DIR"
-            fi
-          fi
+      while true; do
+        GIT_REMOTE_URL=""
+        if ! _pick_ssh_url; then
+          warn "URL setup cancelled — skipping clone"
+          break
         fi
-      fi ;;
+
+        # Selects key + loads into agent (prompts passphrase once, cached after)
+        _test_ssh "$GIT_REMOTE_URL" || break
+
+        # Clear dir if needed
+        if [ -d "$STORE_DIR" ] && [ -n "$(ls -A "$STORE_DIR" 2>/dev/null)" ]; then
+          warn "$STORE_DIR already exists and is not empty"
+          confirm "Remove it and clone fresh?" \
+            && { rm -rf "$STORE_DIR"; step "Removed $STORE_DIR"; } \
+            || { warn "Skipping clone — directory not empty"; break; }
+        fi
+
+        step "Cloning $GIT_REMOTE_URL ..."
+        if git clone "$GIT_REMOTE_URL" "$STORE_DIR" 2>&1; then
+          ok "Cloned to $STORE_DIR"
+          STORE_CLONED=true
+
+          if [ -f "$STORE_DIR/.gpg-id" ]; then
+            local_id="$(cat "$STORE_DIR/.gpg-id" 2>/dev/null | head -1)"
+            info "Store GPG ID: $local_id"
+            if [ -n "${GPG_KEY_ID:-}" ] && [ "${GPG_KEY_ID:-}" != "__SKIP__" ] \
+                && [ "$local_id" != "$GPG_KEY_ID" ]; then
+              warn "Store was encrypted with a different key: $local_id"
+              warn "Make sure you have that key imported, or entries won't decrypt"
+            fi
+          else
+            warn "Cloned repo has no .gpg-id — may not be a valid pass store"
+            dim "Run: pass init <your-gpg-key-id>  inside $STORE_DIR"
+          fi
+          break
+
+        else
+          printf "\n"
+          warn "Clone failed"
+          dim "  URL tried: $GIT_REMOTE_URL"
+          dim "  Key tried: $(basename "$SELECTED_SSH_KEY")"
+          printf "\n"
+          pick_one "What to do?" \
+            "Try a different SSH key" \
+            "Change the repository URL" \
+            "Give up — I'll clone manually"
+          case "$PICKED" in
+            "Try a different"*)
+              SELECTED_SSH_KEY=""
+              ;;
+            "Give up"*)
+              dim "Manual clone:"
+              dim "  git clone $GIT_REMOTE_URL $STORE_DIR"
+              break
+              ;;
+          esac
+          # "Change URL" — loop continues, _pick_ssh_url runs again
+        fi
+      done ;;
 
     "No"*)
       # ── Fresh local store ────────────────────────────────
@@ -880,11 +951,11 @@ fi
 if [ "${GIT_REMOTE_URL:-}" != "" ] && ! $STORE_CLONED; then
   if [ -n "$SELECTED_SSH_KEY" ] && [ -f "${SELECTED_SSH_KEY}.pub" ]; then
     printf "\n"
-    info "SSH public key for ${GIT_REMOTE_URL%%:*} — paste this if not already added:"
+    info "SSH public key — paste this into your git host if not already added:"
     cat "${SELECTED_SSH_KEY}.pub" | sed 's/^/  /'
   elif [ -z "$SELECTED_SSH_KEY" ]; then
     printf "\n"
-    warn "No SSH key found — generate one and add it to your git host before pushing:"
+    warn "No SSH key found — generate one and add it to your git host:"
     dim "  ssh-keygen -t ed25519 -C your@email.com"
   fi
 fi
@@ -915,7 +986,6 @@ else
   fi
   printf "\n"
 
-  # Pre-fill from GPG key if we just created one
   _default_name="${GPG_NAME:-}"
   _default_email="${GPG_EMAIL:-}"
 
