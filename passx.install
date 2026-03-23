@@ -1,0 +1,169 @@
+# ── helpers ───────────────────────────────────────────────────────
+_get_user_info() {
+    local user="${SUDO_USER:-${USER:-$(id -un)}}"
+    local home
+    home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || echo "${HOME:-/root}")"
+    local shell
+    shell="$(getent passwd "$user" 2>/dev/null | cut -d: -f7 || echo "/bin/bash")"
+    printf "%s\t%s\t%s" "$user" "$home" "$(basename "$shell")"
+}
+
+_append_if_missing() {
+    # _append_if_missing <file> <search_pattern> <text_to_append>
+    local file="$1" pattern="$2" text="$3"
+    grep -qF "$pattern" "$file" 2>/dev/null && return 0
+    printf "%s\n" "$text" >> "$file"
+    return 1  # 1 = was added (not already present)
+}
+
+_wire_zsh() {
+    local home="$1" rcfile
+    rcfile="${ZDOTDIR:-$home}/.zshrc"
+    touch "$rcfile" 2>/dev/null || return 0
+
+    local added=false
+
+    # Add fpath entry if missing
+    if ! grep -q '/usr/share/zsh/site-functions' "$rcfile" 2>/dev/null; then
+        printf "\n# passx completions\nfpath=('/usr/share/zsh/site-functions' \$fpath)\n" \
+            >> "$rcfile"
+        added=true
+    fi
+
+    # Add compinit if missing
+    if ! grep -q 'compinit' "$rcfile" 2>/dev/null; then
+        printf "autoload -Uz compinit && compinit\n" >> "$rcfile"
+        added=true
+    fi
+
+    $added && echo "  → zsh: wired completions into $rcfile"
+    $added && echo "    Reload: source $rcfile"
+    return 0
+}
+
+_wire_bash() {
+    local home="$1" rcfile="$home/.bashrc"
+    touch "$rcfile" 2>/dev/null || return 0
+
+    local added=false
+
+    # Check if bash-completion is installed
+    local bc_script=""
+    for f in \
+        /usr/share/bash-completion/bash_completion \
+        /etc/bash_completion \
+        /usr/local/share/bash-completion/bash_completion
+    do
+        [ -f "$f" ] && { bc_script="$f"; break; }
+    done
+
+    if [ -z "$bc_script" ]; then
+        # bash-completion not installed — add a direct source line instead
+        local comp_file="/usr/share/bash-completion/completions/passx"
+        if [ -f "$comp_file" ]; then
+            if ! grep -q "completions/passx" "$rcfile" 2>/dev/null; then
+                printf "\n# passx completions\n[ -f %s ] && source %s\n" \
+                    "$comp_file" "$comp_file" >> "$rcfile"
+                echo "  → bash: sourced passx completions directly in $rcfile"
+                echo "    Reload: source $rcfile"
+                added=true
+            fi
+        else
+            echo "  ℹ bash: install 'bash-completion' for tab completion"
+            echo "    pacman -S bash-completion"
+        fi
+    else
+        # bash-completion is installed — make sure it's sourced in .bashrc
+        if ! grep -q "bash.completion\|bash_completion" "$rcfile" 2>/dev/null; then
+            printf "\n# bash completions (includes passx)\n[ -f %s ] && source %s\n" \
+                "$bc_script" "$bc_script" >> "$rcfile"
+            echo "  → bash: wired bash-completion into $rcfile"
+            echo "    Reload: source $rcfile"
+            added=true
+        else
+            : # already set up — completions will load automatically
+        fi
+    fi
+    return 0
+}
+
+_wire_fish() {
+    local home="$1"
+    # fish auto-loads /usr/share/fish/vendor_completions.d/ — nothing to wire
+    # but tell the user how to reload without restarting
+    local comp="/usr/share/fish/vendor_completions.d/passx.fish"
+    if [ -f "$comp" ]; then
+        echo "  → fish: completions installed, reload with:"
+        echo "    exec fish"
+    fi
+    return 0
+}
+
+_wire_completions() {
+    local info; info="$(_get_user_info)"
+    local user; user="$(echo "$info" | cut -f1)"
+    local home; home="$(echo "$info" | cut -f2)"
+    local shell; shell="$(echo "$info" | cut -f3)"
+
+    echo "  Configuring completions for $user ($shell)..."
+
+    case "$shell" in
+        zsh)  _wire_zsh  "$home" ;;
+        bash) _wire_bash "$home" ;;
+        fish) _wire_fish "$home" ;;
+        *)
+            echo "  ℹ Unknown shell ($shell) — completions installed to system dirs."
+            echo "    Add the right loader for your shell manually."
+            ;;
+    esac
+}
+
+# ── pacman hooks ──────────────────────────────────────────────────
+post_install() {
+    echo ""
+    echo "  ╔══════════════════════════════════════════════════════╗"
+    echo "  ║  passx v1.7.0 installed                              ║"
+    echo "  ╚══════════════════════════════════════════════════════╝"
+    echo ""
+
+    _wire_completions
+
+    echo ""
+    echo "  → Run the setup wizard:"
+    echo ""
+    echo "      passx setup"
+    echo ""
+    echo "  Already use pass?"
+    echo ""
+    echo "      passx doctor    # verify everything"
+    echo "      passx show      # open the picker"
+    echo ""
+}
+
+post_upgrade() {
+    echo ""
+    echo "  passx upgraded to v1.7.0"
+    echo ""
+
+    _wire_completions
+
+    echo ""
+    echo "  What's new:"
+    echo "    · passx vault add|switch|use   — multiple password stores"
+    echo "    · passx team init              — multi-recipient team vault"
+    echo "    · passx db connect|query       — database mode"
+    echo "    · passx find / where           — full-text + URL search"
+    echo "    · passx alias / pin / frecency — smart pickers"
+    echo "    · passx fill (Wayland)         — ydotool support"
+    echo "    · passx setup / config         — interactive wizard"
+    echo ""
+    echo "  Run: passx doctor"
+    echo ""
+}
+
+pre_remove() {
+    echo ""
+    echo "  Removing passx — your password store is NOT touched."
+    echo "  ~/.password-store and all GPG-encrypted files remain intact."
+    echo ""
+}

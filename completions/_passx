@@ -1,0 +1,139 @@
+#compdef passx
+# passx zsh completions v1.7.0
+# Install: /usr/share/zsh/site-functions/_passx  (PKGBUILD does this)
+# Manual:  source <(passx completions zsh)
+
+_passx() {
+  local -a cmds entries ssh_keys gpg_keys
+  cmds=(
+    'add:Add new entry with generated password'
+    'show:Frecency-ranked interactive picker'
+    'copy:Copy field to clipboard'
+    'set-field:Add or update a field value'
+    'rename:Rename / move an entry'
+    'clone:Duplicate an entry'
+    'edit:Edit entry in $EDITOR'
+    'rm:Delete entry (tombstone recorded)'
+    'rotate:Rotate password'
+    'search:Fuzzy search with filters'
+    'find:Full-text search (decrypts)'
+    'where:Reverse URL lookup by domain'
+    'history:Per-entry git changelog'
+    'gen:Generate a password'
+    'otp:Get TOTP code'
+    'otp-show:Live OTP with countdown'
+    'otp-fill:Type OTP via xdotool/ydotool'
+    'otp-list:List OTP entries'
+    'otp-import:Import OTP from QR or manual'
+    'otp-export:Export OTP URL or QR'
+    'otp-qr:Show OTP QR in terminal'
+    'qr:Show field as QR code'
+    'fill:Autotype (X11/Wayland)'
+    'login:Copy username+password'
+    'url:Copy URL and open in browser'
+    'open:Smart launch: URL/SSH/DB'
+    'run:Inject creds as env vars'
+    'snip:Single-decrypt shell export'
+    'db:Database mode'
+    'note:Manage secure notes'
+    'card:Credit card helper'
+    'env:Shell exports'
+    'dotenv:Dotenv format output'
+    'template:Create from template'
+    'template-new:Create user template'
+    'attach:File attachments'
+    'vault:Multiple password stores'
+    'team:Multi-recipient team vault'
+    'alias:Short names for paths'
+    'pin:Pin entries to top of pickers'
+    'frecency:Access frequency rankings'
+    'audit:Scan for weak/duplicate/aged'
+    'hibp:HaveIBeenPwned check'
+    'age:Password age report'
+    'strength:Strength rating'
+    'entropy:Shannon entropy'
+    'lock:Clear clipboard'
+    'share:Encrypt for another GPG key'
+    'reencrypt:Re-encrypt with new keys'
+    'recipients:Show store recipients'
+    'ssh:SSH key picker'
+    'ssh-add:Store SSH keypair'
+    'ssh-set:Restore SSH key'
+    'ssh-rm:Remove SSH keypair'
+    'ssh-list:List SSH keys'
+    'ssh-copy-id:Install key to remote'
+    'ssh-agent-status:Show agent keys'
+    'gpg:GPG key picker'
+    'gpg-add:Store GPG keypair'
+    'gpg-set:Restore GPG key'
+    'gpg-rm:Remove GPG keypair'
+    'gpg-list:List GPG keys'
+    'import-csv:Import from CSV'
+    'import-bitwarden:Import from Bitwarden'
+    'import-firefox:Import from Firefox'
+    'import-chrome:Import from Chrome'
+    'import-keepass:Import from KeePass'
+    'export-bitwarden:Export to Bitwarden'
+    'export-encrypted:Export encrypted archive'
+    'export-age:Export with age encryption'
+    'gc:Garbage collect'
+    'lint:Check entry format'
+    'verify:Decrypt-test all entries'
+    'diff:Diff between git commits'
+    'watch:Watch entry for changes'
+    'config:Interactive config editor'
+    'setup:Full setup wizard'
+    'gen-conf:Generate config file'
+    'tombstone:Deletion log'
+    'clip-history:Clipboard usage log'
+    'meta-build:Build URL/OTP/DB index'
+    'sync:Git push+pull'
+    'log:Git history'
+    'doctor:Dependency check'
+    'stats:Store statistics'
+    'recent:Recently modified'
+    'backup:Encrypted backup'
+    'git:Pass-through to pass git'
+    'ls:List all entries (pass ls)'
+    'completions:Print completion script'
+    'fzf-widget:Print Ctrl+P widget'
+    'cron-check:Silent audit for cron'
+    '--version:Print version'
+    '--help:Full help'
+  )
+
+  _arguments -C '1:command:->cmd' '*:: :->args'
+  case $state in
+    cmd) _describe 'passx command' cmds ;;
+    args)
+      entries=( ${(f)"$(pass ls --flat 2>/dev/null)"} )
+      ssh_keys=( ${(f)"$(pass ls --flat 2>/dev/null | grep '^ssh/.*-pub$' | sed 's/-pub$//')"} )
+      gpg_keys=( ${(f)"$(pass ls --flat 2>/dev/null | grep '^gpg/.*-pub$' | sed 's/-pub$//')"} )
+      case $words[1] in
+        show|copy|set-field|rename|clone|edit|rm|rotate|strength|entropy|\
+        history|otp|otp-show|otp-fill|otp-import|otp-export|otp-qr|\
+        hibp|login|fill|url|open|snip|find|where|note|card|env|dotenv|\
+        run|share|diff|watch|qr|attach)
+          _describe 'entries' entries ;;
+        ssh-set|ssh-rm|ssh-copy-id) _describe 'ssh keys' ssh_keys ;;
+        gpg-set|gpg-rm)             _describe 'gpg keys' gpg_keys ;;
+        vault)  _values 'subcommand' list add switch use env rm status edit prompt ;;
+        team)   _values 'subcommand' init members add-member rm-member log audit sync status ;;
+        db)     _values 'subcommand' list connect query tunnel ;;
+        alias)  _values 'subcommand' add rm list ;;
+        pin)    _values 'subcommand' add rm list ;;
+        frecency) _values 'subcommand' list reset ;;
+        tombstone|clip-history) _values 'subcommand' list clear ;;
+        config) _values 'subcommand' get set reset show interactive ;;
+        setup)  _values 'subcommand' all deps gpg store git config comp check ;;
+        audit)  _values 'flags' --fix --fix-interactive --report ;;
+        hibp)   _values 'flags' --all; _describe 'entries' entries ;;
+        gen)    _values 'flags' --words --pin --pronounceable --length --store --no-copy ;;
+        sync)   _values 'subcommand' status ;;
+        log)    _values 'flags' --graph --all ;;
+        completions|fzf-widget) _values 'shell' bash zsh fish ;;
+        import-*|export-*|backup) _files ;;
+      esac ;;
+  esac
+}
+_passx

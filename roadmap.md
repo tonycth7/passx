@@ -49,7 +49,7 @@ and a complete setup wizard — all in a single portable bash script.
 **New install.sh design 🆕:**
 ```bash
 # One-liner (online):
-curl -fsSL https://raw.githubusercontent.com/tonycrt7/passx/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/tonycth7/passx/main/install.sh | bash
 
 # Offline / AUR post-install hook:
 install.sh --offline   # skips download step, assumes passx already in PATH
