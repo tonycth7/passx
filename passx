@@ -832,33 +832,90 @@ cmd_git() { pass git "$@"; }
 # ════════════════════════════════════════════════════════════════
 cmd_add() {
   _cmd="add"
-  [ "$#" -lt 1 ] && err "Usage: passx add <path> [email] [username] [notes] [length]"
+  [ "$#" -lt 1 ] && err "Usage: passx add <path> [-a] [email] [username] [notes] [length]"
   local path="$1"; shift
 
   # Guard against path traversal
   [[ "$path" == *..* ]] && err "Path cannot contain '..'"
   [[ "$path" == /* ]]   && err "Path must be relative (no leading /)"
 
+  # Parse flags first
+  local ask_pw=false
+  local -a remaining=()
+  for arg in "$@"; do
+    case "$arg" in
+      -a|--ask|--password) ask_pw=true ;;
+      *) remaining+=("$arg") ;;
+    esac
+  done
+  set -- "${remaining[@]+"${remaining[@]}"}"
+
   local email="" user="" notes="" length="$PASSX_GEN_LENGTH"
   for arg in "$@"; do
     case "$arg" in
-      *@*)              email="$arg" ;;
-      [0-9]|[0-9][0-9]|[0-9][0-9][0-9]) length="$arg" ;;
+      *@*)                                    email="$arg" ;;
+      [0-9]|[0-9][0-9]|[0-9][0-9][0-9])     length="$arg" ;;
       *)  [ -z "$user" ] && user="$arg" || notes="$arg" ;;
     esac
   done
+
   local pw
-  pw="$(gen_password "$length")" || err "Password generation failed"
-  [ -z "$pw" ] && err "Password generation produced empty result"
+  if $ask_pw; then
+    # Prompt with confirmation — safe for passwords with special chars
+    local pw2
+    while true; do
+      printf "  Enter password for %s: " "$path" >&2
+      local stty_save; stty_save="$(stty -g </dev/tty 2>/dev/null || true)"
+      stty -echo </dev/tty 2>/dev/null || true
+      read -r pw </dev/tty
+      stty "$stty_save" </dev/tty 2>/dev/null || true
+      printf "\n" >&2
+
+      printf "  Confirm password: " >&2
+      stty -echo </dev/tty 2>/dev/null || true
+      read -r pw2 </dev/tty
+      stty "$stty_save" </dev/tty 2>/dev/null || true
+      printf "\n" >&2
+
+      [ -z "${pw:-}" ] && { warn "Password cannot be empty"; continue; }
+      [ "$pw" = "$pw2" ] && break
+      warn "Passwords do not match, try again"
+    done
+  else
+    pw="$(gen_password "$length")" || err "Password generation failed"
+    [ -z "$pw" ] && err "Password generation produced empty result"
+  fi
+
   _gpg_env
+
+  # Check if entry already exists before trying to insert
+  if pass show "$path" >/dev/null 2>&1; then
+    printf "\n  ${C_YELLOW}Entry already exists: %s${C_RESET}\n" "$path" >&2
+    printf "  Overwrite it? [y/N] " >&2
+    read -r yn </dev/tty || yn=""
+    [ "${yn,,}" != "y" ] && { dim "Aborted"; return 0; }
+    local insert_flags="-m -f"
+  else
+    local insert_flags="-m"
+  fi
+
   {
     printf "%s\n" "$pw"
     [ -n "$email" ]  && printf "email: %s\n"    "$email"
     [ -n "$user"  ]  && printf "username: %s\n" "$user"
     [ -n "$notes" ]  && printf "notes: %s\n"    "$notes"
-  } | pass insert -m "$path" || err "pass insert failed — entry may already exist, use: passx edit $path"
+  } | pass insert $insert_flags "$path" 2>/dev/null \
+    || pass show "$path" >/dev/null 2>&1 \
+    || err "pass insert failed for $path"
+
   ok "Added: $path"
-  clipboard_available && { printf "%s" "$pw" | copy_clipboard --silent; dim "Password copied to clipboard"; } || true
+  if $ask_pw; then
+    dim "Password set as entered"
+  else
+    clipboard_available \
+      && { printf "%s" "$pw" | copy_clipboard --silent
+           dim "Generated password copied to clipboard"; } || true
+  fi
   debug "add: $path"
   _invalidate_cache
   _hook post-add "$path"
