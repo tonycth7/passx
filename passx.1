@@ -1,0 +1,241 @@
+.TH PASSX 1 "2025" "passx 1.7.0" "User Commands"
+.SH NAME
+passx \- power\-user wrapper around the pass password manager
+.SH SYNOPSIS
+.B passx
+[\fICOMMAND\fR] [\fIARGS\fR...]
+.SH DESCRIPTION
+\fBpassx\fR extends \fBpass\fR(1) with an interactive fzf TUI, frecency\-ranked
+pickers, OTP helpers, autofill (X11 and Wayland), a database mode,
+multi\-vault support, team vaults, SSH/GPG key storage, import/export,
+and a full setup wizard.
+.PP
+All data is stored and encrypted by \fBpass\fR. Your \fB~/.password\-store\fR
+is fully compatible with a plain \fBpass\fR installation.
+.SH COMMANDS
+.SS Core
+.TP
+.B add \fIpath\fR [\fIemail\fR] [\fIuser\fR] [\fInotes\fR] [\fIlen\fR]
+Add a new entry. Args detected by type: email\@addr sets email field,
+number sets length, first string sets username, second sets notes.
+.TP
+.B show [\fIpath\fR] [\fB\-p\fR|\fB\-u\fR|\fB\-e\fR|\fB\-n\fR|\fB\-f\fR|\fB\-t\fR]
+Frecency\-ranked picker and action menu. With field flags, prints that field
+(scriptable). Colon syntax: \fBpassx show github:email\fR.
+.TP
+.B copy [\fIpath\fR] [\fB\-p\fR|\fB\-u\fR|\fB\-e\fR|\fB\-n\fR|\fB\-f\fR|\fB\-t\fR]
+Copy field to clipboard. Auto\-clears after \fBPASSX_CLIP_TIMEOUT\fR seconds.
+Warns if password is older than \fBPASSX_MAX_AGE\fR days.
+.TP
+.B edit / rm / rotate / rename / clone / set\-field
+Standard entry management. \fBrm\fR records deletions in the tombstone log.
+\fBrotate\fR asks for confirmation showing current vs new length.
+.TP
+.B search [\fIflags\fR] [\fIquery\fR]
+Fuzzy search. Flags: \fB\-\-has\-otp\fR, \fB\-\-has\-url\fR, \fB\-\-has\-username\fR,
+\fB\-\-has\-email\fR, \fB\-\-weak\fR, \fB\-\-aged\fR, \fB\-\-folder\fR \fIname\fR.
+.TP
+.B find \fIquery\fR [\fB\-\-field\fR \fIfield\fR]
+Full\-text search across decrypted content (requires GPG for every entry).
+.TP
+.B where \fIdomain\fR [\fB\-\-copy\fR] [\fB\-\-fill\fR]
+Reverse URL lookup. Uses metadata cache if available (run \fBmeta\-build\fR first).
+.TP
+.B history [\fIpath\fR]
+Per\-entry git changelog.
+.TP
+.B gen [\fIlen\fR] [\fB\-\-words\fR [\fIn\fR]] [\fB\-\-pin\fR [\fIn\fR]] [\fB\-\-pronounceable\fR]
+Generate a password. Copies to clipboard.
+.SS Smart Features
+.TP
+.B alias add|\fIrm\fR|\fIlist\fR [\fIname\fR] [\fIpath\fR]
+Short names for long paths. Transparent to all commands.
+.TP
+.B pin add|\fIrm\fR|\fIlist\fR [\fIpath\fR]
+Pin entries to the top of all fzf pickers.
+.TP
+.B frecency list|\fIreset\fR [\fIpath\fR]
+View or reset access\-frequency rankings. Pickers sort by frecency automatically.
+.TP
+.B snip [\fIpath\fR] [\fBdotenv\fR]
+Single GPG decryption; outputs all structured fields as shell exports.
+Example: \fBeval $(passx snip db/prod)\fR
+.TP
+.B open [\fIpath\fR]
+Context\-aware launch: URL \(-> browser, host \(-> SSH terminal, host+db \(-> DB client.
+.TP
+.B meta\-build
+Build a metadata cache (URL / OTP / DB fields) for instant \fBwhere\fR and \fBdb list\fR.
+Run once after adding entries with URLs; re\-run to refresh.
+.SS OTP
+.TP
+.B otp [\fB\-n\fR] [\fIpath\fR]
+Get TOTP code. Copies to clipboard unless \fB\-n\fR.
+.TP
+.B otp\-show / otp\-fill / otp\-import / otp\-export / otp\-qr / otp\-list
+Live display, autotype, QR import/export, terminal QR, entry listing.
+.SS Automation
+.TP
+.B fill [\fB\-e\fR] [\fB\-p\fR|\fB\-u\fR] [\fB\-\-delay\fR \fIN\fR] [\fB\-\-no\-delay\fR] [\fIpath\fR]
+Autotype credentials. Uses \fBxdotool\fR on X11 or \fBydotool\fR on Wayland.
+Countdown shows target window name. \fB\-e\fR presses Enter after password.
+.TP
+.B run \fIpath\fR \fIcommand\fR [\fIargs\fR...]
+Run a command with credentials as env vars. Smart mappings for
+ssh, psql, mysql, aws, kubectl, docker, vault, redis, mongo.
+.SS Database Mode
+.TP
+.B db list
+List database entries with auto\-detected type.
+.TP
+.B db connect [\fIpath\fR]
+Open interactive shell (pgcli/psql/mycli/mysql/redis\-cli/mongosh).
+.TP
+.B db query \fIpath\fR \fISQL\fR
+Run one SQL statement non\-interactively.
+.TP
+.B db tunnel [\fIpath\fR]
+SSH tunnel to remote database via a jump host.
+.SS Vault System
+.TP
+.B vault list|add|\fIswitch\fR|\fIuse\fR|\fIenv\fR|\fIrm\fR|\fIstatus\fR|\fIedit\fR|\fIprompt\fR
+Multiple independent password stores.
+.RS
+.TP
+.B vault add \fIname\fR
+Creates config at \fI~/.config/passx/vaults/NAME\fR and optionally initialises the store.
+.TP
+.B vault switch \fIname\fR
+Sets the active vault for future sessions.
+.TP
+.B vault use \fIname\fR [--] \fIcmd\fR
+Run ONE command in that vault without changing the active vault.
+.TP
+.B vault env [\fIname\fR]
+Print \fBexport PASSWORD_STORE_DIR=...\fR for use in the current shell:
+\fBeval $(passx vault env work)\fR
+.RE
+.TP
+.B team init|add\-member|\fIrm\-member\fR|\fImembers\fR|\fIlog\fR|\fIaudit\fR|\fIsync\fR
+Multi\-recipient vault. Adding/removing a member re\-encrypts the entire store
+with \fBpass init\fR for the new key list.
+.SS Security
+.TP
+.B audit [\fB\-\-fix\fR] [\fB\-\-fix\-interactive\fR] [\fB\-\-report\fR]
+Scan for weak, duplicate, or aged passwords.
+\fB\-\-fix\fR rotates all weak entries automatically.
+\fB\-\-fix\-interactive\fR prompts per entry: [r]otate [d]elete [s]kip [v]iew.
+.TP
+.B hibp [\fB\-\-all\fR] [\fIpath\fR]
+Check against HaveIBeenPwned using k\-anonymity (only first 5 SHA1 chars sent).
+.TP
+.B age [\fIdays\fR]
+Show password age from git history. Highlights entries older than threshold.
+.TP
+.B strength / entropy
+4\-point character\-class score and Shannon entropy in bits.
+.SS SSH / GPG Keys
+.TP
+.B ssh [picker] / ssh\-add / ssh\-set / ssh\-rm / ssh\-list / ssh\-copy\-id
+Store, restore, and manage SSH keypairs. \fBssh\fR alone opens a smart picker.
+.TP
+.B gpg / gpg\-add / gpg\-set / gpg\-rm / gpg\-list
+Same for GPG keypairs. \fBgpg\-set\fR imports the key, sets ultimate trust,
+and optionally makes it the default in \fI~/.gnupg/gpg.conf\fR.
+.SS Import / Export
+.TP
+.B import\-csv / import\-bitwarden / import\-firefox / import\-chrome / import\-keepass
+Import from various password manager formats.
+.TP
+.B export\-bitwarden \fIout.json\fR
+Export decrypted entries as Bitwarden JSON. Keep the output secure.
+.TP
+.B export\-encrypted \fIfile.gpg\fR / export\-age \fIfile.tar.age\fR
+Full store backups. Restore age backup: \fBage \-d file.tar.age | tar \-xz \-C ~\fR
+.SS Setup and Config
+.TP
+.B setup [\fBall\fR|\fIdeps\fR|\fIgpg\fR|\fIstore\fR|\fIgit\fR|\fIconfig\fR|\fIcomp\fR|\fIcheck\fR]
+Full interactive wizard. Each step is idempotent; safe to re\-run.
+.TP
+.B config [\fBget\fR|\fIset\fR|\fIreset\fR|\fIshow\fR|\fIinteractive\fR]
+fzf\-based configuration editor. Settings saved to \fI~/.config/passx/passx.conf\fR.
+.SS Maintenance
+.TP
+.B gc [\fB\-\-rm\fR]
+Garbage collect orphaned key halves (pub without pvt, etc.).
+.TP
+.B tombstone list|\fIclear\fR
+Log of deleted entries (timestamp, entry, user@host).
+.TP
+.B clip\-history [\fBclear\fR]
+Clipboard usage log (entry + field only, never the value).
+.TP
+.B cron\-check
+Silent audit for cron. Exits 1 if any passwords are weak or overdue.
+.SH ENVIRONMENT
+.TP
+.B PASSWORD_STORE_DIR
+Path to the password store. Default: \fI~/.password\-store\fR.
+Set by the active vault at startup.
+.TP
+.B PASSX_AUTOSYNC
+Run \fBpass git push\fR after every write. Default: \fBfalse\fR
+.TP
+.B PASSX_CLIP_TIMEOUT
+Clipboard auto\-clear delay in seconds. Default: \fB20\fR
+.TP
+.B PASSX_MAX_AGE
+Password age warning threshold in days. Default: \fB180\fR
+.TP
+.B PASSX_THEME
+fzf colour theme: \fBcatppuccin\fR (default), \fBnord\fR, \fBgruvbox\fR, \fBdracula\fR, \fBsolarized\fR
+.TP
+.B PASSX_GEN_LENGTH
+Default generated password length. Default: \fB32\fR
+.TP
+.B PASSX_FRECENCY
+Enable frecency\-ranked pickers. Default: \fBtrue\fR
+.TP
+.B PASSX_WARN_STALE
+Warn on copy when password is older than PASSX_MAX_AGE. Default: \fBtrue\fR
+.TP
+.B PASSX_AUTOFILL_DELAY
+Autofill countdown seconds. Default: \fB3\fR
+.TP
+.B PASSX_DB_CLIENT
+Database client override. Default: \fBauto\fR
+.TP
+.B PASSX_TOMBSTONE
+Record deletions to tombstone log. Default: \fBtrue\fR
+.SH FILES
+.TP
+.I ~/.config/passx/passx.conf
+Main configuration file. Generated by \fBpassx gen\-conf\fR or \fBpassx setup\fR.
+.TP
+.I ~/.config/passx/vaults/
+Vault config files (one per vault).
+.TP
+.I ~/.config/passx/teams/
+Team metadata files.
+.TP
+.I ~/.cache/passx/entries
+Entry list cache (invalidated on writes).
+.TP
+.I ~/.cache/passx/metadata
+URL/OTP/DB metadata cache (built by \fBpassx meta\-build\fR).
+.TP
+.I ~/.cache/passx/frecency
+Access frequency data for ranked pickers.
+.TP
+.I ~/.cache/passx/active_vault
+Name of the currently active vault.
+.TP
+.I ~/.config/passx/tombstone
+Log of deleted entries.
+.TP
+.I ~/.cache/passx/clip_log
+Clipboard usage log.
+.SH BUGS
+Report bugs at: https://github.com/tonycth7/passx/issues
+.SH AUTHOR
+tonycth

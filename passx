@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # ╔════════════════════════════════════════════════════════════════╗
-# ║  passx  —  power-user wrapper around 'pass'                    ║
-# ║  Version: 1.0.0                                                ║
-# ╚════════════════════════════════════════════════════════════════╝
+# ║  passx  v1.7.0  —  power-user password manager                  ║
+# ║  pass · fzf TUI · OTP · autofill · DB mode · multi-vault        ║
+# ╚══════════════════════════════════════════════════════════════════╝
 set -euo pipefail
-PASSX_VERSION="1.0.0"
+PASSX_VERSION="1.7.0"
+export GIT_TERMINAL_PROMPT=0
 
 # ════════════════════════════════════════════════════════════════
 # § THEME / COLORS
@@ -49,6 +50,7 @@ _init_colors
 PASSX_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/passx"
 PASSX_HOOKS_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/passx/hooks"
 PASSX_CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/passx"
+PASSX_TEMPLATES_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/passx/templates"
 PASSX_LOG="$PASSX_CACHE_DIR/log"
 
 # Load config if present (prefer passx/passx.conf over root passx.conf)
@@ -59,7 +61,7 @@ elif [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/passx.conf" ]; then
 fi
 
 # Apply defaults for anything not set (allows config or env to override)
-: "${PASSWORD_STORE_DIR:=$HOME/.password-store}"
+# PASSWORD_STORE_DIR is set by _passx_init after loading vault config
 : "${PASSX_AUTOSYNC:=false}"
 : "${PASSX_CLIP_TIMEOUT:=20}"
 : "${PASSX_MAX_AGE:=180}"
@@ -70,8 +72,50 @@ fi
 : "${PASSX_GEN_LENGTH:=32}"
 : "${PASSX_GEN_CHARS:=A-Za-z0-9@#%+=_}"
 : "${PASSX_JSON:=0}"
+# ── v1.7 additions ──────────────────────────────────────────────
+: "${PASSX_FRECENCY:=true}"
+: "${PASSX_WARN_STALE:=true}"
+: "${PASSX_AUTOFILL_DELAY:=3}"
+: "${PASSX_PARALLEL_JOBS:=4}"
+: "${PASSX_TOMBSTONE:=true}"
+: "${PASSX_DB_CLIENT:=auto}"
+: "${PASSX_SSH_TERMINAL:=${TERMINAL:-xterm}}"
+: "${PASSX_ACTIVE_VAULT:=}"
 
 _init_colors  # re-run in case PASSX_THEME was changed by config
+
+# ── Apply active vault (if any) ──────────────────────────────────
+_passx_init() {
+  local cmd="${1:-}"
+  mkdir -p "$PASSX_CACHE_DIR" "$PASSX_CONF_DIR" "$PASSX_HOOKS_DIR" "$PASSX_TEMPLATES_DIR"
+
+  # ── Load active vault config, which sets PASSWORD_STORE_DIR ──
+  # Only override if not already set via environment (allows: PASSWORD_STORE_DIR=x passx ...)
+  if [ -z "${PASSWORD_STORE_DIR:-}" ]; then
+    local _av="${PASSX_ACTIVE_VAULT:-}"
+    [ -z "$_av" ] && _av="$(cat "$PASSX_CACHE_DIR/active_vault" 2>/dev/null || true)"
+    if [ -n "$_av" ]; then
+      local _vf="$PASSX_CONF_DIR/vaults/$_av"
+      if [ -f "$_vf" ]; then
+        # Source vault config — must export PASSWORD_STORE_DIR
+        source "$_vf" 2>/dev/null || true
+      fi
+    fi
+    # Final fallback default
+    PASSWORD_STORE_DIR="${PASSWORD_STORE_DIR:-$HOME/.password-store}"
+  fi
+  export PASSWORD_STORE_DIR
+
+  # ── Skip pass check for commands that don't need it ──────────
+  case "$cmd" in
+    setup|--help|-h|help|-V|--version|doctor|completions|fzf-widget|vault) return 0 ;;
+  esac
+  command -v pass >/dev/null 2>&1 || {
+    printf "\n${C_RED}${C_BOLD}  ✖  'pass' is not installed.${C_RESET}\n"
+    printf "  ${C_DIM}Run: passx setup  to configure everything${C_RESET}\n\n"
+    exit 1
+  }
+}
 
 # ════════════════════════════════════════════════════════════════
 # § PRINT HELPERS
@@ -224,16 +268,145 @@ cmd_lock() {
   _notify passx "Clipboard cleared"
 }
 
+# ── Clipboard usage log (entry+field only, never the value) ──────
+_clip_log() {
+  local entry="$1" field="${2:-password}"
+  local log="$PASSX_CACHE_DIR/clip_log"
+  mkdir -p "$PASSX_CACHE_DIR"
+  printf "%s  %-36s  %s\n" "$(date '+%H:%M:%S')" "$entry" "$field" >> "$log"
+  # Keep last 200 lines
+  tail -200 "$log" > "${log}.tmp" 2>/dev/null && mv "${log}.tmp" "$log" || true
+}
+
+cmd_clip_history() {
+  _cmd="clip-history"
+  local log="$PASSX_CACHE_DIR/clip_log"
+  [ "${1:-}" = "clear" ] && { rm -f "$log"; ok "Clip history cleared"; return 0; }
+  [ -f "$log" ] || { info "No clip history yet."; return 0; }
+  _banner "Clipboard History  (last 50)"
+  tail -50 "$log" | while IFS= read -r line; do
+    printf "  ${C_DIM}%s${C_RESET}\n" "$line"
+  done; echo ""
+}
+
+# ── Tombstone — record deletions ─────────────────────────────────
+_tombstone_record() {
+  [ "$PASSX_TOMBSTONE" = "true" ] || return 0
+  local entry="$1"
+  printf "%s\t%s\t%s@%s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$entry" \
+    "$USER" "$(hostname -s 2>/dev/null || echo local)" \
+    >> "$PASSX_CONF_DIR/tombstone"
+}
+
+cmd_tombstone() {
+  _cmd="tombstone"
+  local tfile="$PASSX_CONF_DIR/tombstone"
+  case "${1:-list}" in
+    list)
+      [ -f "$tfile" ] || { info "No deletions recorded."; return 0; }
+      _banner "Deleted Entries"
+      while IFS=$'\t' read -r ts entry who; do
+        printf "  ${C_DIM}%s${C_RESET}  ${C_RED}%-36s${C_RESET}  ${C_DIM}%s${C_RESET}\n" \
+          "$ts" "$entry" "$who"
+      done < "$tfile"; echo "" ;;
+    clear) rm -f "$tfile"; ok "Tombstone log cleared" ;;
+    *) err "Usage: passx tombstone [list|clear]" ;;
+  esac
+}
+
 # ════════════════════════════════════════════════════════════════
 # § ENTRY LISTING
 # ════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════
+# § ENTRY LISTING + CACHE + FRECENCY
+# ════════════════════════════════════════════════════════════════
+_cache_file()    { printf "%s/entries"  "$PASSX_CACHE_DIR"; }
+_frecency_file() { printf "%s/frecency" "$PASSX_CACHE_DIR"; }
+_meta_file()     { printf "%s/metadata" "$PASSX_CACHE_DIR"; }
+
+_invalidate_cache() {
+  rm -f "$(_cache_file)" "$(_meta_file)"
+  # Touch sentinel so next cache check knows it's stale
+  touch "$PASSX_CACHE_DIR/.invalidated" 2>/dev/null || true
+  debug "cache invalidated"
+}
+
 list_entries() {
-  if pass ls --flat >/dev/null 2>&1; then
-    pass ls --flat 2>/dev/null | sort
-  else
-    find "$PASSWORD_STORE_DIR" -type f -name '*.gpg' 2>/dev/null \
-      | sed "s|^$PASSWORD_STORE_DIR/||; s|\.gpg$||" | sort
+  local cache; cache="$(_cache_file)"
+  local sentinel="$PASSX_CACHE_DIR/.invalidated"
+  # Cache valid if it exists AND newer than the invalidation sentinel
+  if [ -f "$cache" ] && { [ ! -f "$sentinel" ] || [ "$cache" -nt "$sentinel" ]; }; then
+    cat "$cache"; return
   fi
+  local entries
+  if pass ls --flat >/dev/null 2>&1; then
+    entries="$(pass ls --flat 2>/dev/null | sort)"
+  else
+    entries="$(find "$PASSWORD_STORE_DIR" -type f -name '*.gpg' 2>/dev/null \
+      | sed "s|^$PASSWORD_STORE_DIR/||; s|\.gpg$||" | sort)"
+  fi
+  mkdir -p "$PASSX_CACHE_DIR"
+  printf "%s\n" "$entries" > "$cache"
+  rm -f "$sentinel"
+  printf "%s\n" "$entries"
+}
+
+# ── Frecency tracking ────────────────────────────────────────────
+_frecency_record() {
+  [ "$PASSX_FRECENCY" = "true" ] || return 0
+  local entry="$1"; [ -z "$entry" ] && return 0
+  local file now count; file="$(_frecency_file)"; now="$(date +%s)"
+  mkdir -p "$PASSX_CACHE_DIR"
+  if grep -qF "	${entry}$" "$file" 2>/dev/null; then
+    count="$(awk -F'\t' -v e="$entry" '$3==e{print $2}' "$file" 2>/dev/null || echo 0)"
+    count=$((${count:-0} + 1))
+    local tmp; tmp="$(mktemp)"
+    awk -F'\t' -v e="$entry" -v n="$now" -v c="$count" \
+      '$3==e{print n"\t"c"\t"e; next} {print}' "$file" > "$tmp" && mv "$tmp" "$file"
+  else
+    printf "%s\t1\t%s\n" "$now" "$entry" >> "$file"
+  fi
+}
+
+_frecency_score() {
+  local epoch="$1" count="$2" now days
+  now="$(date +%s)"; days=$(( (now - epoch) / 86400 + 1 ))
+  awk -v c="$count" -v d="$days" 'BEGIN{printf "%.4f", c/sqrt(d)}'
+}
+
+list_entries_frecency() {
+  [ "$PASSX_FRECENCY" != "true" ] && { list_entries; return; }
+  local file; file="$(_frecency_file)"
+  local all; all="$(list_entries)"
+  [ ! -f "$file" ] && { printf "%s\n" "$all"; return; }
+  local scored="" unscored=""
+  while IFS= read -r entry; do
+    [ -z "$entry" ] && continue
+    local row; row="$(grep -F "	${entry}$" "$file" 2>/dev/null | head -1 || true)"
+    if [ -n "$row" ]; then
+      local epoch count
+      epoch="$(printf "%s" "$row" | cut -f1)"
+      count="$(printf "%s" "$row" | cut -f2)"
+      scored+="$(_frecency_score "$epoch" "$count")	$entry"$'\n'
+    else
+      unscored+="$entry"$'\n'
+    fi
+  done <<< "$all"
+  printf "%s" "$scored" | sort -t$'\t' -k1 -rn | cut -f2
+  printf "%s" "$unscored"
+}
+
+# ── Pinned entries ───────────────────────────────────────────────
+_pin_file() { printf "%s/pinned" "$PASSX_CONF_DIR"; }
+
+_prepend_pinned() {
+  local file; file="$(_pin_file)"
+  [ -f "$file" ] && cat "$file" || true
+}
+
+# ── Combined ranked list (pinned first, then frecency) ───────────
+list_entries_ranked() {
+  { _prepend_pinned; list_entries_frecency; } | awk '!seen[$0]++'
 }
 
 # ════════════════════════════════════════════════════════════════
@@ -396,7 +569,7 @@ PASSX_DEBUG="0"       # Write execution trace to $PASSX_CACHE_DIR/log
 EOF
 
   ok "Generated sample configuration at $conf_file"
-  dim "Edit this file to set your default preferences."
+  dim "Edit this file or use: passx config"
 }
 
 # ════════════════════════════════════════════════════════════════
@@ -687,6 +860,7 @@ cmd_add() {
   ok "Added: $path"
   clipboard_available && { printf "%s" "$pw" | copy_clipboard --silent; dim "Password copied to clipboard"; } || true
   debug "add: $path"
+  _invalidate_cache
   _hook post-add "$path"
   _autosync
 }
@@ -696,12 +870,22 @@ cmd_add() {
 # ════════════════════════════════════════════════════════════════
 cmd_template() {
   _cmd="template"
-  local show_pw=true
-  [ "${1:-}" = "-n" ] && { show_pw=false; shift; }
-  command -v fzf >/dev/null 2>&1 || err "fzf required"
-  local ttype
-  ttype="$(printf "web-login\nserver\ndatabase\napi-key\nemail-account\ncredit-card\nsoftware-license\nwifi\nnote" \
-    | _fzf_pick "template" "Choose entry type" 40%)" || return 0
+  local show_pw=true ask_pw=false
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -n)         show_pw=false ;;
+      -a|--ask)   ask_pw=true ;;
+      --help|-h)  _help template; return 0 ;;
+      *)          break ;;
+    esac; shift
+  done
+  local ttype="${1:-}"
+  # If type passed as arg, skip fzf; otherwise show picker
+  if [ -z "$ttype" ]; then
+    command -v fzf >/dev/null 2>&1 || err "fzf required (or pass type directly: passx template database)"
+    ttype="$(printf "web-login\nserver\ndatabase\napi-key\nemail-account\ncredit-card\nsoftware-license\nwifi\nnote" \
+      | _fzf_pick "template" "Choose entry type" 40%)" || return 0
+  fi
   [ -z "$ttype" ] && return 0
   printf "\n  Store path (e.g. work/github): " >&2; read -r tpath </dev/tty || true
   [ -z "${tpath:-}" ] && { dim "Aborted"; return 0; }
@@ -792,6 +976,7 @@ cmd_template() {
       dim "Password copied to clipboard (clears in ${PASSX_CLIP_TIMEOUT}s)"; } || true
   fi
   echo ""
+  _invalidate_cache
   _hook post-add "$tpath"
   _autosync
 }
@@ -1029,6 +1214,9 @@ cmd_copy() {
   fi
   printf "%s" "$val" | tr -d '\n' | copy_clipboard || err "Copy failed"
   _notify passx "$field copied from ${path##*/}"
+  _clip_log "$path" "$field"
+  _warn_stale "$path"
+  _frecency_record "$path"
 }
 
 # ════════════════════════════════════════════════════════════════
@@ -1626,7 +1814,11 @@ cmd_login() {
 
 cmd_fill() {
   _cmd="fill"
+<<<<<<< HEAD:passx-1.0.sh
   local enter_after=false delay_secs=3 pass_only=false user_only=false
+=======
+  local enter_after=false delay_secs="${PASSX_AUTOFILL_DELAY:-3}" pass_only=false user_only=false
+>>>>>>> dev:passx
   while [ "$#" -gt 0 ]; do
     case "$1" in
       -e)           enter_after=true ;;
@@ -1636,6 +1828,7 @@ cmd_fill() {
       --no-delay)   delay_secs=0 ;;
       -*) err "Usage: passx fill [-e] [-p|--pass] [-u|--user] [--delay N] [--no-delay] <path>" ;;
       *)  break ;;
+<<<<<<< HEAD:passx-1.0.sh
     esac
     shift
   done
@@ -1643,11 +1836,32 @@ cmd_fill() {
   [ -z "$path" ] && path="$(list_entries | _fzf_pick "fill" "Select entry to autofill")" || true
   [ -z "${path:-}" ] && err "Usage: passx fill [-e] <path>"
   command -v xdotool >/dev/null 2>&1 || err "xdotool required"
+=======
+    esac; shift
+  done
+  local path="${1:-}"; path="$(_resolve_alias "${path:-}")"
+  [ -z "$path" ] && path="$(list_entries_ranked | _fzf_pick "fill" "Select entry to autofill")" || true
+  [ -z "${path:-}" ] && err "No entry"
+
+  # Detect autofill backend
+  local fill_backend=""
+  if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ]; then
+    command -v ydotool >/dev/null 2>&1 \
+      && fill_backend="ydotool" \
+      || err "ydotool required for Wayland autofill. Install ydotool and start ydotoold daemon."
+  else
+    command -v xdotool >/dev/null 2>&1 \
+      && fill_backend="xdotool" \
+      || err "xdotool required for X11 autofill"
+  fi
+
+>>>>>>> dev:passx
   local user passw
   user="$(extract_field "$path" username || true)"
   passw="$(extract_field "$path" password || true)"
   [ -z "${user:-}" ] && [ -z "${passw:-}" ] && err "No credentials in $path"
 
+<<<<<<< HEAD:passx-1.0.sh
   # Countdown so user can focus the target window
   if [ "$delay_secs" -gt 0 ]; then
     for ((i=delay_secs; i>0; i--)); do
@@ -1676,6 +1890,54 @@ cmd_fill() {
   [ -n "${passw:-}" ] && { xdotool type --delay 20 --clearmodifiers "$passw"; sleep 0.08; }
   $enter_after && xdotool key --clearmodifiers Return
   ok "Autofilled ${path##*/}"
+=======
+  # Countdown + show target window name
+  if [ "$delay_secs" -gt 0 ]; then
+    local win_name=""
+    [ "$fill_backend" = "xdotool" ] && \
+      win_name="$(xdotool getactivewindow getwindowname 2>/dev/null | head -c 50 || true)"
+    for ((i=delay_secs; i>0; i--)); do
+      if [ -n "$win_name" ]; then
+        printf "  ${C_CYAN}⌨  ${C_BOLD}%s${C_RESET}${C_CYAN} → %s in %ds${C_RESET}  \r" \
+          "${path##*/}" "$win_name" "$i" >&2
+      else
+        printf "  ${C_CYAN}⌨  Autofilling ${C_BOLD}%s${C_RESET}${C_CYAN} in %ds ...${C_RESET}  \r" \
+          "${path##*/}" "$i" >&2
+      fi; sleep 1
+    done
+    printf "%-70s\r" "" >&2
+  fi
+
+  _do_type() {
+    local text="$1" delay="${2:-25}"
+    case "$fill_backend" in
+      ydotool) ydotool type --key-delay "$delay" "$text" ;;
+      xdotool) xdotool type --delay "$delay" --clearmodifiers "$text" ;;
+    esac
+  }
+  _do_key() {
+    local key="$1"
+    case "$fill_backend" in
+      ydotool) ydotool key "$key" ;;
+      xdotool) xdotool key --clearmodifiers "$key" ;;
+    esac
+  }
+
+  if $user_only; then
+    [ -z "${user:-}" ] && err "No username in $path"
+    _do_type "$user"; ok "Typed username for ${path##*/}"; return 0
+  fi
+  if $pass_only; then
+    [ -z "${passw:-}" ] && err "No password in $path"
+    _do_type "$passw" 20; $enter_after && _do_key "Return"
+    ok "Typed password for ${path##*/}"; return 0
+  fi
+  [ -n "${user:-}" ]  && { _do_type "$user"; sleep 0.08; }
+  _do_key "Tab"; sleep 0.08
+  [ -n "${passw:-}" ] && { _do_type "$passw" 20; sleep 0.08; }
+  $enter_after && _do_key "Return"
+  _frecency_record "$path"; ok "Autofilled ${path##*/}"
+>>>>>>> dev:passx
 }
 
 cmd_url() {
@@ -1780,11 +2042,14 @@ print(p,m,n)
 
 cmd_rotate() {
   _cmd="rotate"
+  local no_confirm=false
+  [ "${1:-}" = "--no-confirm" ] && { no_confirm=true; shift; }
   local path="${1:-}" length="${2:-$PASSX_GEN_LENGTH}"
   [ -z "$path" ] && path="$(list_entries | _fzf_pick "rotate" "Select entry to rotate")" || true
   [ -z "${path:-}" ] && err "Usage: passx rotate <path> [length]"
   pass show "$path" >/dev/null 2>&1 || err "Entry not found: $path"
 
+<<<<<<< HEAD:passx-1.0.sh
   local cur_len
   cur_len="$(pass show "$path" | sed -n '1p' | tr -d '\n' | wc -c)"
   printf "\n  ${C_YELLOW}${C_BOLD}Rotate password for '%s'?${C_RESET}\n" "$path" >&2
@@ -1793,6 +2058,18 @@ cmd_rotate() {
   printf "  Confirm [y/N]: " >&2
   local yn; read -r yn </dev/tty || yn=""
   [ "${yn,,}" != "y" ] && { dim "Aborted"; return 0; }
+=======
+  if ! $no_confirm; then
+    local cur_len
+    cur_len="$(pass show "$path" | sed -n '1p' | tr -d '\n' | wc -c)"
+    printf "\n  ${C_YELLOW}${C_BOLD}Rotate password for '%s'?${C_RESET}\n" "$path" >&2
+    printf "  Current length: ${C_DIM}%d chars${C_RESET}  →  New length: ${C_BOLD}%d chars${C_RESET}\n" \
+      "$cur_len" "$length" >&2
+    printf "  Confirm [y/N]: " >&2
+    local yn; read -r yn </dev/tty || yn=""
+    [ "${yn,,}" != "y" ] && { dim "Aborted"; return 0; }
+  fi
+>>>>>>> dev:passx
 
   local newpw rest
   newpw="$(gen_password "$length")"
@@ -1804,6 +2081,7 @@ cmd_rotate() {
   ok "Rotated password for $path"
   dim "New password copied to clipboard"
   _notify passx "Password rotated: ${path##*/}"
+  _invalidate_cache
   _hook post-rotate "$path"
   _autosync
 }
@@ -1818,6 +2096,8 @@ cmd_rm() {
   [ "${yn,,}" != "y" ] && { dim "Aborted"; return 0; }
   pass rm -r "$path" || err "pass rm failed"
   ok "Removed: $path"
+  _tombstone_record "$path"
+  _invalidate_cache
   _hook post-rm "$path"
   _autosync
 }
@@ -1835,6 +2115,10 @@ cmd_edit() {
   _gpg_env
   env EDITOR="$editor" GPG_TTY="$GPG_TTY" pass edit "$path" \
     || err "Edit failed — check GPG key and pinentry setup"
+<<<<<<< HEAD:passx-1.0.sh
+=======
+  _invalidate_cache
+>>>>>>> dev:passx
   _hook post-edit "$path"
   _autosync
 }
@@ -1859,8 +2143,15 @@ _score_password() {
 
 cmd_audit() {
   _cmd="audit"
-  local fix_mode=false
-  [ "${1:-}" = "--fix" ] && fix_mode=true
+  local fix_mode=false fix_interactive=false report_mode=false
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --fix)              fix_mode=true ;;
+      --fix-interactive|-i) fix_interactive=true ;;
+      --report)           report_mode=true ;;
+      --help|-h)          _help audit; return 0 ;;
+    esac; shift
+  done
   _banner "Password Audit"
   local entries; entries="$(list_entries | grep -v '\-pub$\|-pvt$' || true)"
   declare -A _seen
@@ -1903,10 +2194,26 @@ cmd_audit() {
     [ -n "$issues" ] && {
       printf "  %-40s " "$entry"
       printf "%b\n" "$issues"
-      $fix_mode && [[ "$issues" == *WEAK* ]] && {
+      if $fix_interactive && [[ "$issues" == *WEAK* ]]; then
+        printf "  ${C_DIM}[r]otate  [d]elete  [s]kip  [v]iew${C_RESET}  ❯ " >&2
+        local choice; read -r choice </dev/tty || choice="s"
+        case "${choice,,}" in
+          r) cmd_rotate "$entry" --no-confirm >/dev/null \
+               && printf "     ${C_GREEN}✔ rotated${C_RESET}\n" || true ;;
+          d) cmd_rm "$entry" -y >/dev/null \
+               && printf "     ${C_GREEN}✔ deleted${C_RESET}\n" || true ;;
+          v) pass show "$entry" | head -6 | sed 's/^/     /'
+             printf "  ${C_DIM}[r]otate  [s]kip${C_RESET}  ❯ " >&2
+             read -r choice </dev/tty || choice="s"
+             [ "${choice,,}" = "r" ] && cmd_rotate "$entry" --no-confirm >/dev/null \
+               && printf "     ${C_GREEN}✔ rotated${C_RESET}\n" || true ;;
+          *) printf "     ${C_DIM}skipped${C_RESET}\n" ;;
+        esac
+      elif $fix_mode && [[ "$issues" == *WEAK* ]]; then
         printf "     ${C_DIM}→ rotating...${C_RESET}\n"
-        cmd_rotate "$entry" >/dev/null && printf "     ${C_GREEN}✔ rotated${C_RESET}\n" || true
-      }
+        cmd_rotate "$entry" --no-confirm >/dev/null \
+          && printf "     ${C_GREEN}✔ rotated${C_RESET}\n" || true
+      fi
     }
   done <<< "$entries"
   echo ""
@@ -1921,7 +2228,9 @@ cmd_audit() {
                     || printf "  %-26s ${C_GREEN}0 — all good${C_RESET}\n" "Aged"
   echo ""
   [ $((weak+dupes+aged)) -eq 0 ] && ok "All passwords look healthy!"
-  $fix_mode && [ $weak -gt 0 ] && info "Weak passwords have been rotated"
+  $fix_mode       && [ $weak -gt 0 ] && info "Weak passwords rotated"
+  $fix_interactive && [ $weak -gt 0 ] && info "Interactive fix complete"
+  $report_mode && _json_kv total "$total" weak "$weak" dupes "$dupes" aged "$aged"
   return 0
 }
 
@@ -2928,8 +3237,9 @@ cmd_completions() {
 
 _comp_bash() {
 cat <<'BASH'
-# passx bash completions
-# Usage: source <(passx completions bash)   or add to ~/.bashrc
+# passx bash completions v1.7.0
+# Auto-loaded from: /usr/share/bash-completion/completions/passx
+# Or manually:      source <(passx completions bash)
 
 _passx_entries() {
   pass ls --flat 2>/dev/null \
@@ -2945,16 +3255,7 @@ _passx() {
     cword=$COMP_CWORD
   }
 
-  local all_cmds="add show copy set-field rename clone search otp otp-show otp-fill
-    otp-list otp-import otp-export otp-qr audit hibp age lock fill login url open
-    rotate strength entropy rm edit note card env dotenv run qr template gen gen-conf
-    ssh-add ssh-set ssh-rm ssh-list ssh-copy-id ssh-agent-status
-    gpg-add gpg-set gpg-rm gpg-list
-    share recipients reencrypt
-    import-csv import-bitwarden import-firefox import-chrome import-keepass
-    export-bitwarden export-encrypted
-    gc lint verify diff watch git sync log doctor recent stats backup
-    completions fzf-widget cron-check --version --help"
+  local all_cmds="add show copy set-field rename clone search find where history otp otp-show otp-fill otp-list otp-import otp-export otp-qr qr fill login url open run snip db note card env dotenv template template-new attach vault team alias pin frecency audit hibp age strength entropy lock share recipients reencrypt ssh ssh-add ssh-set ssh-rm ssh-list ssh-copy-id ssh-agent-status gpg gpg-add gpg-set gpg-rm gpg-list import-csv import-bitwarden import-firefox import-chrome import-keepass export-bitwarden export-encrypted export-age gc lint verify diff watch config setup gen gen-conf tombstone clip-history meta-build sync log doctor stats recent backup ls git completions fzf-widget cron-check --version --help"
 
   if [ "$cword" -eq 1 ]; then
     COMPREPLY=( $(compgen -W "$all_cmds" -- "$cur") )
@@ -2962,23 +3263,48 @@ _passx() {
   fi
 
   case "$prev" in
-    show|copy|set-field|rename|clone|edit|rm|rotate|strength|entropy|\
-    otp|otp-show|otp-fill|otp-import|otp-export|otp-qr|hibp|login|\
-    fill|url|open|note|card|env|dotenv|run|share|diff|watch|qr)
+    show|copy|set-field|rename|clone|edit|rm|rotate|strength|entropy|history|\
+    otp|otp-show|otp-fill|otp-import|otp-export|otp-qr|hibp|login|fill|url|\
+    open|snip|find|where|note|card|env|dotenv|run|share|diff|watch|qr|attach)
       COMPREPLY=( $(compgen -W "$(_passx_entries)" -- "$cur") );;
+    vault)
+      COMPREPLY=( $(compgen -W "list add switch use env rm status edit prompt" -- "$cur") );;
+    team)
+      COMPREPLY=( $(compgen -W "init members add-member rm-member log audit sync status" -- "$cur") );;
+    db)
+      COMPREPLY=( $(compgen -W "list connect query tunnel" -- "$cur") );;
+    alias)
+      COMPREPLY=( $(compgen -W "add rm list" -- "$cur") );;
+    pin)
+      COMPREPLY=( $(compgen -W "add rm list" -- "$cur") );;
+    frecency)
+      COMPREPLY=( $(compgen -W "list reset" -- "$cur") );;
+    tombstone|clip-history)
+      COMPREPLY=( $(compgen -W "list clear" -- "$cur") );;
+    config)
+      COMPREPLY=( $(compgen -W "get set reset show interactive" -- "$cur") );;
+    setup)
+      COMPREPLY=( $(compgen -W "all deps gpg store git config comp check" -- "$cur") );;
     ssh-set|ssh-rm|ssh-copy-id)
       COMPREPLY=( $(compgen -W "$(pass ls --flat 2>/dev/null \
         | grep '^ssh/.*-pub$' | sed 's/-pub$//')" -- "$cur") );;
     gpg-set|gpg-rm)
       COMPREPLY=( $(compgen -W "$(pass ls --flat 2>/dev/null \
         | grep '^gpg/.*-pub$' | sed 's/-pub$//')" -- "$cur") );;
-    audit)  COMPREPLY=( $(compgen -W "--fix" -- "$cur") );;
-    hibp)   COMPREPLY=( $(compgen -W "--all $(_passx_entries)" -- "$cur") );;
-    gen)    COMPREPLY=( $(compgen -W "--words --pin --pronounceable --length --store --no-copy" -- "$cur") );;
+    audit)
+      COMPREPLY=( $(compgen -W "--fix --fix-interactive --report" -- "$cur") );;
+    hibp)
+      COMPREPLY=( $(compgen -W "--all $(_passx_entries)" -- "$cur") );;
+    gen)
+      COMPREPLY=( $(compgen -W "--words --pin --pronounceable --length --store --no-copy" -- "$cur") );;
+    sync)
+      COMPREPLY=( $(compgen -W "status" -- "$cur") );;
+    log)
+      COMPREPLY=( $(compgen -W "--graph --all" -- "$cur") );;
     completions|fzf-widget)
       COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") );;
     import-csv|import-bitwarden|import-firefox|import-chrome|import-keepass|\
-    export-bitwarden|export-encrypted|backup)
+    export-bitwarden|export-encrypted|export-age|backup)
       COMPREPLY=( $(compgen -f -- "$cur") );;
   esac
   return 0
@@ -2991,83 +3317,105 @@ BASH
 _comp_zsh() {
 cat <<'ZSH'
 #compdef passx
-# passx zsh completions
-# Usage: source <(passx completions zsh)
+# passx zsh completions v1.7.0
+# Install: /usr/share/zsh/site-functions/_passx  (PKGBUILD does this)
+# Manual:  source <(passx completions zsh)
 
 _passx() {
   local -a cmds entries ssh_keys gpg_keys
   cmds=(
-    'add:Add a new entry'
-    'show:Interactive picker / show fields'
+    'add:Add new entry with generated password'
+    'show:Frecency-ranked interactive picker'
     'copy:Copy field to clipboard'
-    'set-field:Set a field value'
-    'rename:Rename an entry'
-    'clone:Clone an entry'
-    'search:Fuzzy-search entries'
-    'otp:Get OTP code'
-    'otp-show:Live OTP display'
-    'otp-fill:Type OTP via xdotool'
-    'otp-list:List OTP entries'
-    'otp-import:Import OTP from QR image'
-    'otp-export:Export OTP URL / QR'
-    'otp-qr:Show OTP QR in terminal'
-    'audit:Audit passwords for weakness'
-    'hibp:HaveIBeenPwned check'
-    'age:Password age report'
-    'lock:Clear clipboard now'
-    'fill:Autotype credentials'
-    'login:Copy user+password'
-    'url:Copy and open URL'
-    'open:Alias for url'
+    'set-field:Add or update a field value'
+    'rename:Rename / move an entry'
+    'clone:Duplicate an entry'
+    'edit:Edit entry in $EDITOR'
+    'rm:Delete entry (tombstone recorded)'
     'rotate:Rotate password'
-    'strength:Strength report'
-    'entropy:Shannon entropy'
-    'rm:Delete entry'
-    'edit:Edit entry in editor'
+    'search:Fuzzy search with filters'
+    'find:Full-text search (decrypts)'
+    'where:Reverse URL lookup by domain'
+    'history:Per-entry git changelog'
+    'gen:Generate a password'
+    'otp:Get TOTP code'
+    'otp-show:Live OTP with countdown'
+    'otp-fill:Type OTP via xdotool/ydotool'
+    'otp-list:List OTP entries'
+    'otp-import:Import OTP from QR or manual'
+    'otp-export:Export OTP URL or QR'
+    'otp-qr:Show OTP QR in terminal'
+    'qr:Show field as QR code'
+    'fill:Autotype (X11/Wayland)'
+    'login:Copy username+password'
+    'url:Copy URL and open in browser'
+    'open:Smart launch: URL/SSH/DB'
+    'run:Inject creds as env vars'
+    'snip:Single-decrypt shell export'
+    'db:Database mode'
     'note:Manage secure notes'
     'card:Credit card helper'
-    'env:Output as shell exports'
-    'dotenv:Output as .env format'
-    'run:Run command with creds injected'
-    'qr:Show password as QR code'
-    'template:Create entry from template'
-    'gen:Generate a password'
-    'gen-conf:Generate ~/.config/passx/passx.conf configuration file'
-    'ssh-add:Store SSH keypair'
-    'ssh-set:Restore SSH key from store'
-    'ssh-rm:Remove SSH keypair from store'
-    'ssh-list:List SSH keys in store'
-    'ssh-copy-id:Install public key to remote'
-    'ssh-agent-status:Show ssh-agent keys'
-    'gpg-add:Store GPG keypair'
-    'gpg-set:Restore GPG key from store'
-    'gpg-rm:Remove GPG keypair from store'
-    'gpg-list:List GPG keys in store'
-    'share:Re-encrypt entry for another GPG key'
+    'env:Shell exports'
+    'dotenv:Dotenv format output'
+    'template:Create from template'
+    'template-new:Create user template'
+    'attach:File attachments'
+    'vault:Multiple password stores'
+    'team:Multi-recipient team vault'
+    'alias:Short names for paths'
+    'pin:Pin entries to top of pickers'
+    'frecency:Access frequency rankings'
+    'audit:Scan for weak/duplicate/aged'
+    'hibp:HaveIBeenPwned check'
+    'age:Password age report'
+    'strength:Strength rating'
+    'entropy:Shannon entropy'
+    'lock:Clear clipboard'
+    'share:Encrypt for another GPG key'
+    'reencrypt:Re-encrypt with new keys'
     'recipients:Show store recipients'
-    'reencrypt:Re-encrypt store with new recipients'
-    'import-csv:Import from generic CSV'
-    'import-bitwarden:Import from Bitwarden JSON'
-    'import-firefox:Import from Firefox CSV'
-    'import-chrome:Import from Chrome CSV'
-    'import-keepass:Import from KeePass XML'
-    'export-bitwarden:Export to Bitwarden JSON'
+    'ssh:SSH key picker'
+    'ssh-add:Store SSH keypair'
+    'ssh-set:Restore SSH key'
+    'ssh-rm:Remove SSH keypair'
+    'ssh-list:List SSH keys'
+    'ssh-copy-id:Install key to remote'
+    'ssh-agent-status:Show agent keys'
+    'gpg:GPG key picker'
+    'gpg-add:Store GPG keypair'
+    'gpg-set:Restore GPG key'
+    'gpg-rm:Remove GPG keypair'
+    'gpg-list:List GPG keys'
+    'import-csv:Import from CSV'
+    'import-bitwarden:Import from Bitwarden'
+    'import-firefox:Import from Firefox'
+    'import-chrome:Import from Chrome'
+    'import-keepass:Import from KeePass'
+    'export-bitwarden:Export to Bitwarden'
     'export-encrypted:Export encrypted archive'
+    'export-age:Export with age encryption'
     'gc:Garbage collect'
-    'lint:Lint store entries'
-    'verify:Verify all entries decrypt'
-    'diff:Diff entry between commits'
+    'lint:Check entry format'
+    'verify:Decrypt-test all entries'
+    'diff:Diff between git commits'
     'watch:Watch entry for changes'
-    'git:Pass-through to pass git'
+    'config:Interactive config editor'
+    'setup:Full setup wizard'
+    'gen-conf:Generate config file'
+    'tombstone:Deletion log'
+    'clip-history:Clipboard usage log'
+    'meta-build:Build URL/OTP/DB index'
     'sync:Git push+pull'
-    'log:Show git history'
-    'doctor:Dependency and env check'
-    'recent:Recently modified entries'
+    'log:Git history'
+    'doctor:Dependency check'
     'stats:Store statistics'
+    'recent:Recently modified'
     'backup:Encrypted backup'
-    'completions:Print shell completion script'
-    'fzf-widget:Print fzf shell widget'
-    'cron-check:Cron-safe audit (silent unless issues)'
+    'git:Pass-through to pass git'
+    'ls:List all entries (pass ls)'
+    'completions:Print completion script'
+    'fzf-widget:Print Ctrl+P widget'
+    'cron-check:Silent audit for cron'
     '--version:Print version'
     '--help:Full help'
   )
@@ -3080,16 +3428,28 @@ _passx() {
       ssh_keys=( ${(f)"$(pass ls --flat 2>/dev/null | grep '^ssh/.*-pub$' | sed 's/-pub$//')"} )
       gpg_keys=( ${(f)"$(pass ls --flat 2>/dev/null | grep '^gpg/.*-pub$' | sed 's/-pub$//')"} )
       case $words[1] in
-        show|copy|set-field|rename|edit|rm|rotate|strength|entropy|otp|otp-show|\
-        otp-fill|otp-import|otp-export|otp-qr|hibp|login|fill|url|open|note|\
-        card|env|dotenv|run|share|diff|watch|qr|clone)
+        show|copy|set-field|rename|clone|edit|rm|rotate|strength|entropy|\
+        history|otp|otp-show|otp-fill|otp-import|otp-export|otp-qr|\
+        hibp|login|fill|url|open|snip|find|where|note|card|env|dotenv|\
+        run|share|diff|watch|qr|attach)
           _describe 'entries' entries ;;
         ssh-set|ssh-rm|ssh-copy-id) _describe 'ssh keys' ssh_keys ;;
-        gpg-set|gpg-rm) _describe 'gpg keys' gpg_keys ;;
+        gpg-set|gpg-rm)             _describe 'gpg keys' gpg_keys ;;
+        vault)  _values 'subcommand' list add switch use env rm status edit prompt ;;
+        team)   _values 'subcommand' init members add-member rm-member log audit sync status ;;
+        db)     _values 'subcommand' list connect query tunnel ;;
+        alias)  _values 'subcommand' add rm list ;;
+        pin)    _values 'subcommand' add rm list ;;
+        frecency) _values 'subcommand' list reset ;;
+        tombstone|clip-history) _values 'subcommand' list clear ;;
+        config) _values 'subcommand' get set reset show interactive ;;
+        setup)  _values 'subcommand' all deps gpg store git config comp check ;;
+        audit)  _values 'flags' --fix --fix-interactive --report ;;
+        hibp)   _values 'flags' --all; _describe 'entries' entries ;;
+        gen)    _values 'flags' --words --pin --pronounceable --length --store --no-copy ;;
+        sync)   _values 'subcommand' status ;;
+        log)    _values 'flags' --graph --all ;;
         completions|fzf-widget) _values 'shell' bash zsh fish ;;
-        audit) _values 'flags' --fix ;;
-        hibp)  _values 'flags' --all; _describe 'entries' entries ;;
-        gen)   _values 'flags' --words --pin --pronounceable --length --store --no-copy ;;
         import-*|export-*|backup) _files ;;
       esac ;;
   esac
@@ -3100,45 +3460,55 @@ ZSH
 
 _comp_fish() {
 cat <<'FISH'
-# passx fish completions
-# Usage: source (passx completions fish | psub)
+# passx fish completions v1.7.0
+# Install: /usr/share/fish/vendor_completions.d/passx.fish  (PKGBUILD)
+# Manual:  passx completions fish | source
 
-set -l cmds add show copy set-field rename clone search otp otp-show otp-fill \
-  otp-list otp-import otp-export otp-qr audit hibp age lock fill login url open \
-  rotate strength entropy rm edit note card env dotenv run qr template gen gen-conf \
-  ssh-add ssh-set ssh-rm ssh-list ssh-copy-id ssh-agent-status \
-  gpg-add gpg-set gpg-rm gpg-list share recipients reencrypt \
-  import-csv import-bitwarden import-firefox import-chrome import-keepass \
-  export-bitwarden export-encrypted gc lint verify diff watch git sync log \
-  doctor recent stats backup completions fzf-widget cron-check
+set -l cmds add show copy set-field rename clone search find where history otp otp-show otp-fill otp-list otp-import otp-export otp-qr qr fill login url open run snip db note card env dotenv template template-new attach vault team alias pin frecency audit hibp age strength entropy lock share recipients reencrypt ssh ssh-add ssh-set ssh-rm ssh-list ssh-copy-id ssh-agent-status gpg gpg-add gpg-set gpg-rm gpg-list import-csv import-bitwarden import-firefox import-chrome import-keepass export-bitwarden export-encrypted export-age gc lint verify diff watch config setup gen gen-conf tombstone clip-history meta-build sync log doctor stats recent backup git ls completions fzf-widget cron-check tombstone clip-history meta-build
 
 complete -c passx -f -n 'not __fish_seen_subcommand_from $cmds' -a "$cmds"
 
 # Entry completions
-for cmd in show copy set-field rename edit rm rotate strength entropy otp otp-show \
-           otp-fill otp-export otp-qr hibp login fill url open note card env dotenv \
-           run share diff watch qr clone
+for cmd in show copy set-field rename clone edit rm rotate strength entropy \
+           history otp otp-show otp-fill otp-export otp-qr hibp login \
+           fill url open snip find where note card env dotenv run \
+           share diff watch qr attach
   complete -c passx -f -n "__fish_seen_subcommand_from $cmd" \
     -a "(pass ls --flat 2>/dev/null)"
 end
 
-# SSH key completions
+# Subcommand completions
+complete -c passx -f -n '__fish_seen_subcommand_from vault' \
+  -a 'list add switch use env rm status edit prompt'
+complete -c passx -f -n '__fish_seen_subcommand_from team' \
+  -a 'init members add-member rm-member log audit sync status'
+complete -c passx -f -n '__fish_seen_subcommand_from db' \
+  -a 'list connect query tunnel'
+complete -c passx -f -n '__fish_seen_subcommand_from alias' -a 'add rm list'
+complete -c passx -f -n '__fish_seen_subcommand_from pin'   -a 'add rm list'
+complete -c passx -f -n '__fish_seen_subcommand_from frecency' -a 'list reset'
+complete -c passx -f -n '__fish_seen_subcommand_from tombstone' -a 'list clear'
+complete -c passx -f -n '__fish_seen_subcommand_from clip-history' -a 'clear'
+complete -c passx -f -n '__fish_seen_subcommand_from config' \
+  -a 'get set reset show interactive'
+complete -c passx -f -n '__fish_seen_subcommand_from setup' \
+  -a 'all deps gpg store git config comp check'
+complete -c passx -f -n '__fish_seen_subcommand_from sync' -a 'status'
+complete -c passx -f -n '__fish_seen_subcommand_from log'  -a '--graph --all'
+
 for cmd in ssh-set ssh-rm ssh-copy-id
   complete -c passx -f -n "__fish_seen_subcommand_from $cmd" \
     -a "(pass ls --flat 2>/dev/null | grep '^ssh/.*-pub\$' | sed 's/-pub\$//')"
 end
-
-# GPG key completions
 for cmd in gpg-set gpg-rm
   complete -c passx -f -n "__fish_seen_subcommand_from $cmd" \
     -a "(pass ls --flat 2>/dev/null | grep '^gpg/.*-pub\$' | sed 's/-pub\$//')"
 end
 
-# Shell completions
 complete -c passx -f -n '__fish_seen_subcommand_from completions fzf-widget' \
-  -a "bash zsh fish"
-
-complete -c passx -f -n '__fish_seen_subcommand_from audit' -a '--fix'
+  -a 'bash zsh fish'
+complete -c passx -f -n '__fish_seen_subcommand_from audit' \
+  -a '--fix --fix-interactive --report'
 complete -c passx -f -n '__fish_seen_subcommand_from hibp'  -a '--all'
 complete -c passx -f -n '__fish_seen_subcommand_from gen'   \
   -a '--words --pin --pronounceable --length --store --no-copy'
@@ -3155,90 +3525,93 @@ _help() {
     overview|--help|-h)
       cat <<HELP
 
-${C_BOLD}${C_CYAN}  passx${C_RESET} ${C_DIM}v${PASSX_VERSION}${C_RESET}  —  power-user wrapper for pass
+${C_BOLD}${C_CYAN}  passx${C_RESET} ${C_DIM}v${PASSX_VERSION}${C_RESET}  —  power-user password manager for the terminal
 
 ${C_BOLD}  USAGE${C_RESET}
     passx <command> [args...]
     passx <command> --help
 
 ${C_BOLD}  CORE${C_RESET}
-    ${C_GREEN}show${C_RESET}     [path] [-u|-e|-n|-p|-f]   Interactive picker + field display
-    ${C_GREEN}copy${C_RESET}     [path] [-u|-e|-n|-p|-f]   Copy field to clipboard
-    ${C_GREEN}add${C_RESET}      <path> [email] [user] [notes] [len]
-    ${C_GREEN}edit${C_RESET}     [path]                Edit entry in \$EDITOR
-    ${C_GREEN}rm${C_RESET}       [path]         Delete entry (with confirmation)
-    ${C_GREEN}rotate${C_RESET}   [path] [len]   Generate new password
-    ${C_GREEN}rename${C_RESET}   [old] [new]    Rename / move entry
-    ${C_GREEN}clone${C_RESET}    [src] [dst]    Duplicate entry
-    ${C_GREEN}search${C_RESET}   [query]        Fuzzy search
+    ${C_GREEN}show${C_RESET}     [path] [-u|-e|-n|-p|-f]   Frecency-ranked picker + action menu
+    ${C_GREEN}copy${C_RESET}     [path] [-u|-e|-n|-p|-f]   Copy field to clipboard  (stale warning)
+    ${C_GREEN}add${C_RESET}      <path> [-a|--password] [email] [user] [notes] [len]
+    ${C_GREEN}edit${C_RESET} / ${C_GREEN}rm${C_RESET} / ${C_GREEN}rotate${C_RESET} / ${C_GREEN}rename${C_RESET} / ${C_GREEN}clone${C_RESET}
+    ${C_GREEN}search${C_RESET}   [flags] [q]    --has-otp/url/username/email/weak/aged/--folder
+    ${C_GREEN}find${C_RESET}     <q> [--field]  Full-text search across decrypted content
+    ${C_GREEN}where${C_RESET}    <domain>       Reverse URL lookup  (--copy  --fill)
+    ${C_GREEN}history${C_RESET}  [path]         Per-entry git changelog
     ${C_GREEN}gen${C_RESET}      [len] [--words|--pin|--pronounceable]
 
-${C_BOLD}  FIELDS${C_RESET}
-    ${C_GREEN}set-field${C_RESET} <path> <field> [val]
-    Use colon syntax in show/copy:  ${C_DIM}passx show github:email${C_RESET}
-    Flags: ${C_DIM}-p password  -u username  -e email  -n notes  -f full  -t token${C_RESET}
+${C_BOLD}  SMART FEATURES${C_RESET}
+    ${C_GREEN}alias${C_RESET}    add|rm|list    Short names — passx alias add aws work/aws/prod/user
+    ${C_GREEN}pin${C_RESET}      add|rm|list    Pin entries to top of every picker
+    ${C_GREEN}frecency${C_RESET} list|reset     Access frequency rankings (auto-learned)
+    ${C_GREEN}snip${C_RESET}     [path] [dotenv]  Single-decrypt shell export:  eval \$(passx snip db/prod)
+    ${C_GREEN}open${C_RESET}     [path]         Smart launch: url→browser  host→SSH  db→client
+    ${C_GREEN}config${C_RESET}   [get|set|reset|show|interactive]  fzf-based config editor
 
 ${C_BOLD}  OTP${C_RESET}
-    ${C_GREEN}otp${C_RESET}          [-n]   Copy OTP (−n = print only, no copy)
-    ${C_GREEN}otp-show${C_RESET}            Live OTP with progress bar
-    ${C_GREEN}otp-fill${C_RESET}            Type OTP into focused field (xdotool)
-    ${C_GREEN}otp-list${C_RESET}            List all OTP entries
-    ${C_GREEN}otp-import${C_RESET}  <qr>   Import from QR image (zbarimg)
-    ${C_GREEN}otp-export${C_RESET}  [--qr <file>]
-    ${C_GREEN}otp-qr${C_RESET}              Show OTP QR in terminal
-    ${C_GREEN}qr${C_RESET}          [field] Show any field as QR
+    ${C_GREEN}otp${C_RESET} [-n] / ${C_GREEN}otp-show${C_RESET} / ${C_GREEN}otp-fill${C_RESET} / ${C_GREEN}otp-list${C_RESET} / ${C_GREEN}otp-import${C_RESET} / ${C_GREEN}otp-export${C_RESET} / ${C_GREEN}otp-qr${C_RESET}
+    All OTP pickers show only OTP-configured entries.
 
 ${C_BOLD}  AUTOMATION${C_RESET}
+<<<<<<< HEAD:passx-1.0.sh
     ${C_GREEN}fill${C_RESET}     [-e] [-p|--pass] [-u|--user] [--delay N] [--no-delay]
                  Autotype user + TAB + pass  (−e = press Enter after, 3s countdown)
     ${C_GREEN}login${C_RESET}          Copy username + password together
     ${C_GREEN}url${C_RESET}            Copy URL and open in browser
     ${C_GREEN}run${C_RESET}     <cmd>  Inject creds as env vars — never in shell history
+=======
+    ${C_GREEN}fill${C_RESET}  [-e] [-p] [-u] [--delay N] [--no-delay]
+             X11: xdotool  |  Wayland: ydotool  — shows target window name in countdown
+    ${C_GREEN}login${C_RESET} / ${C_GREEN}url${C_RESET} / ${C_GREEN}run${C_RESET} <cmd>  (ssh/psql/mysql/aws/kubectl/docker/vault/redis/mongo/...)
+
+${C_BOLD}  DATABASE MODE${C_RESET}
+    ${C_GREEN}db${C_RESET} list                  List all database entries (type auto-detected)
+    ${C_GREEN}db${C_RESET} connect [path]         Interactive shell (pgcli/psql/mycli/redis-cli/mongosh)
+    ${C_GREEN}db${C_RESET} query <path> <SQL>     Run one query non-interactively
+    ${C_GREEN}db${C_RESET} tunnel [path]          SSH tunnel to remote database
+>>>>>>> dev:passx
 
 ${C_BOLD}  SECRETS${C_RESET}
-    ${C_GREEN}note${C_RESET}    [list|show|edit|copy]
-    ${C_GREEN}card${C_RESET}    [list|show|(cp-num)copy-number|(cp-cvv)copy-cvv]
-    ${C_GREEN}env${C_RESET}     [list|export|dotenv|show]   Output as shell exports or .env format
-    ${C_GREEN}dotenv${C_RESET}                     Alias: env dotenv
-    ${C_GREEN}template${C_RESET}                   Interactive: web/server/db/api-key/card/wifi/note
+    ${C_GREEN}note${C_RESET} / ${C_GREEN}card${C_RESET} / ${C_GREEN}env${C_RESET} / ${C_GREEN}dotenv${C_RESET}
+    ${C_GREEN}template${C_RESET} [-a] [-n]      Built-in + user-defined templates with field validation
+    ${C_GREEN}template-new${C_RESET}            Create custom template in ~/.config/passx/templates/
+    ${C_GREEN}attach${C_RESET} add|get|ls|rm   GPG-encrypted file attachments alongside entries
+
+${C_BOLD}  VAULT SYSTEM${C_RESET}
+    ${C_GREEN}vault${C_RESET} list|add|switch|use|rm|status|prompt
+              Multiple independent stores with separate git + GPG key
+              passx vault use work -- copy github
+    ${C_GREEN}team${C_RESET}  init|add-member|rm-member|members|log|audit
+              Multi-recipient vault with automatic commit attribution
 
 ${C_BOLD}  SECURITY${C_RESET}
-    ${C_GREEN}audit${C_RESET}   [--fix]   Weak / duplicate / aged passwords
-    ${C_GREEN}hibp${C_RESET}    [--all]   HaveIBeenPwned (k-anonymity)
-    ${C_GREEN}age${C_RESET}     [days]    Password age report
-    ${C_GREEN}strength${C_RESET}          4-point strength rating
-    ${C_GREEN}entropy${C_RESET}           Shannon entropy in bits
-    ${C_GREEN}lock${C_RESET}              Clear clipboard immediately
-    ${C_GREEN}share${C_RESET}   <gpg-id>  Encrypt entry for another person
-    ${C_GREEN}reencrypt${C_RESET}         Re-encrypt store with new recipients
-    ${C_GREEN}recipients${C_RESET}        Show current recipients
+    ${C_GREEN}audit${C_RESET} [--fix|--fix-interactive|--report]
+    ${C_GREEN}hibp${C_RESET} [--all]  /  ${C_GREEN}age${C_RESET}  /  ${C_GREEN}strength${C_RESET}  /  ${C_GREEN}entropy${C_RESET}  /  ${C_GREEN}lock${C_RESET}
+    ${C_GREEN}share${C_RESET} / ${C_GREEN}reencrypt${C_RESET} / ${C_GREEN}recipients${C_RESET}
 
-${C_BOLD}  SSH KEYS${C_RESET}
-    ${C_GREEN}ssh-add${C_RESET}           Store SSH keypair in pass
-    ${C_GREEN}ssh-set${C_RESET}           Restore key to ~/.ssh/ + ssh-agent
-    ${C_GREEN}ssh-rm${C_RESET}            Remove both -pub and -pvt
-    ${C_GREEN}ssh-list${C_RESET}          List stored keys
-    ${C_GREEN}ssh-copy-id${C_RESET}       Install public key to remote host
-    ${C_GREEN}ssh-agent-status${C_RESET}  Show loaded agent keys
-
-${C_BOLD}  GPG KEYS${C_RESET}
-    ${C_GREEN}gpg-add${C_RESET}  /  ${C_GREEN}gpg-set${C_RESET}  /  ${C_GREEN}gpg-rm${C_RESET}  /  ${C_GREEN}gpg-list${C_RESET}
+${C_BOLD}  SSH / GPG${C_RESET}
+    ${C_GREEN}ssh${C_RESET}  ${C_GREEN}ssh-add${C_RESET}  ${C_GREEN}ssh-set${C_RESET}  ${C_GREEN}ssh-list${C_RESET}  ${C_GREEN}ssh-rm${C_RESET}  ${C_GREEN}ssh-copy-id${C_RESET}  ${C_GREEN}ssh-agent-status${C_RESET}
+    ${C_GREEN}gpg${C_RESET}  ${C_GREEN}gpg-add${C_RESET}  ${C_GREEN}gpg-set${C_RESET}  ${C_GREEN}gpg-list${C_RESET}  ${C_GREEN}gpg-rm${C_RESET}
 
 ${C_BOLD}  IMPORT / EXPORT${C_RESET}
-    ${C_GREEN}import-csv${C_RESET}        /  ${C_GREEN}import-bitwarden${C_RESET}  /  ${C_GREEN}import-firefox${C_RESET}
-    ${C_GREEN}import-chrome${C_RESET}     /  ${C_GREEN}import-keepass${C_RESET}
-    ${C_GREEN}export-bitwarden${C_RESET}  /  ${C_GREEN}export-encrypted${C_RESET}
+    ${C_GREEN}import-csv${C_RESET} / ${C_GREEN}import-bitwarden${C_RESET} / ${C_GREEN}import-firefox${C_RESET} / ${C_GREEN}import-chrome${C_RESET} / ${C_GREEN}import-keepass${C_RESET}
+    All support ${C_DIM}--merge${C_RESET} for incremental re-imports
+    ${C_GREEN}export-bitwarden${C_RESET}  /  ${C_GREEN}export-encrypted${C_RESET}  /  ${C_GREEN}export-age${C_RESET}
 
-${C_BOLD}  MAINTENANCE & CONFIG${C_RESET}
-    ${C_GREEN}gc${C_RESET}         Garbage collect (orphaned keys)
-    ${C_GREEN}lint${C_RESET}       Check formatting and missing fields
-    ${C_GREEN}verify${C_RESET}     Decrypt-test every entry
-    ${C_GREEN}diff${C_RESET}       Decrypted diff between git commits
-    ${C_GREEN}watch${C_RESET}      Watch entry for changes (git poll)
-    ${C_GREEN}gen-conf${C_RESET}   Generate configuration file at ~/.config/passx/passx.conf
-    ${C_GREEN}git${C_RESET}        Pass-through: passx git <args>
+${C_BOLD}  MAINTENANCE${C_RESET}
+    ${C_GREEN}gc${C_RESET} / ${C_GREEN}lint${C_RESET} / ${C_GREEN}verify${C_RESET} / ${C_GREEN}diff${C_RESET} / ${C_GREEN}watch${C_RESET}
+    ${C_GREEN}tombstone${C_RESET} list|clear     Log of deleted entries
+    ${C_GREEN}clip-history${C_RESET} [clear]     Clipboard usage log (entry+field only, never the value)
+
+${C_BOLD}  SETUP & CONFIG${C_RESET}
+    ${C_GREEN}setup${C_RESET} [all|deps|gpg|store|git|config|comp|check]
+              Full interactive wizard — safe to re-run, each step is idempotent
+    ${C_GREEN}config${C_RESET} [get|set|reset|show]  /  ${C_GREEN}gen-conf${C_RESET}
 
 ${C_BOLD}  TOOLS${C_RESET}
+<<<<<<< HEAD:passx-1.0.sh
     ${C_GREEN}sync${C_RESET}       Git push + pull  (use: sync status  to check without syncing)
     ${C_GREEN}log${C_RESET}        Git history  (--graph, --all)
     ${C_GREEN}doctor${C_RESET}     Dependency + env check
@@ -3248,19 +3621,18 @@ ${C_BOLD}  TOOLS${C_RESET}
     ${C_GREEN}completions${C_RESET}  bash|zsh|fish  — print completion script
     ${C_GREEN}fzf-widget${C_RESET}   bash|zsh|fish  — print Ctrl+P shell widget
     ${C_GREEN}cron-check${C_RESET}   Silent audit for cron
+=======
+    ${C_GREEN}sync${C_RESET} [status]  /  ${C_GREEN}log${C_RESET} [N] [--graph] [--all]  /  ${C_GREEN}doctor${C_RESET}
+    ${C_GREEN}stats${C_RESET}  /  ${C_GREEN}recent${C_RESET}  /  ${C_GREEN}backup${C_RESET}  /  ${C_GREEN}git${C_RESET} <args>
+    ${C_GREEN}completions${C_RESET} bash|zsh|fish  /  ${C_GREEN}fzf-widget${C_RESET} bash|zsh|fish
+    ${C_GREEN}cron-check${C_RESET}   Silent audit for cron (exit 1 if problems)
+>>>>>>> dev:passx
 
-${C_BOLD}  ENVIRONMENT VARIABLES (and ~/.config/passx/passx.conf)${C_RESET}
-    ${C_DIM}PASSWORD_STORE_DIR${C_RESET}   default: ~/.password-store
-    ${C_DIM}PASSX_AUTOSYNC${C_RESET}       auto-push after changes  (false)
-    ${C_DIM}PASSX_CLIP_TIMEOUT${C_RESET}   clipboard auto-clear secs (20)
-    ${C_DIM}PASSX_MAX_AGE${C_RESET}        audit age threshold days  (180)
-    ${C_DIM}PASSX_NOTIFY${C_RESET}         notify-send on events     (true)
-    ${C_DIM}PASSX_THEME${C_RESET}          catppuccin|nord|gruvbox|dracula|solarized
-    ${C_DIM}PASSX_GEN_LENGTH${C_RESET}     default generated length  (32)
-    ${C_DIM}PASSX_GEN_CHARS${C_RESET}      charset for gen_password
-    ${C_DIM}PASSX_JSON${C_RESET}           set to 1 for JSON output  (0)
-    ${C_DIM}PASSX_DEBUG${C_RESET}          set to 1 for debug log    (0)
-    ${C_DIM}PASSX_COLOR${C_RESET}          auto|always|never
+${C_BOLD}  ENVIRONMENT  (override or set in ~/.config/passx/passx.conf)${C_RESET}
+    ${C_DIM}PASSWORD_STORE_DIR  PASSX_AUTOSYNC   PASSX_CLIP_TIMEOUT  PASSX_MAX_AGE${C_RESET}
+    ${C_DIM}PASSX_THEME         PASSX_GEN_LENGTH PASSX_FRECENCY      PASSX_WARN_STALE${C_RESET}
+    ${C_DIM}PASSX_AUTOFILL_DELAY PASSX_DB_CLIENT PASSX_SSH_TERMINAL  PASSX_TOMBSTONE${C_RESET}
+    Run ${C_GREEN}passx config${C_RESET} to edit interactively.
 
 HELP
     ;;
@@ -3417,8 +3789,1519 @@ HELP
 }
 
 # ════════════════════════════════════════════════════════════════
+# § SSH SMART PICKER  (passx ssh — jump straight to key action menu)
+# ════════════════════════════════════════════════════════════════
+cmd_ssh() {
+  _cmd="ssh"
+  command -v fzf >/dev/null 2>&1 || err "fzf required"
+  # List only stored SSH keys
+  local keys; keys="$(list_entries | grep '^ssh/.*-pub$' | sed 's/-pub$//' || true)"
+  [ -z "${keys:-}" ] && {
+    info "No SSH keys stored.  Add one: passx ssh-add"
+    return 0
+  }
+  local chosen
+  chosen="$(printf "%s\n" "$keys" \
+    | _fzf_pick "ssh" "Your SSH keys — pick one")" || return 0
+  [ -z "${chosen:-}" ] && return 0
+
+  local action
+  action="$(printf "restore to ~/.ssh/ + agent\ncopy public key\nshow public key\nshow fingerprint\ninstall to remote\nremove from store" \
+    | _fzf_pick "ssh: $chosen" "Action" 30%)" || return 0
+
+  case "$action" in
+    "restore to ~/.ssh/ + agent")   cmd_ssh_set  "$chosen" ;;
+    "copy public key")
+      pass show "${chosen}-pub" 2>/dev/null | copy_clipboard \
+        && ok "Public key copied" ;;
+    "show public key")
+      pass show "${chosen}-pub" 2>/dev/null; echo "" ;;
+    "show fingerprint")
+      pass show "${chosen}-pub" 2>/dev/null \
+        | ssh-keygen -l -f /dev/stdin 2>/dev/null || warn "ssh-keygen failed" ;;
+    "install to remote")
+      printf "  Remote (user@host): " >&2; read -r remote </dev/tty
+      [ -n "${remote:-}" ] && cmd_ssh_copy_id "$chosen" "$remote" ;;
+    "remove from store") cmd_ssh_rm "$chosen" ;;
+  esac
+}
+
+# ════════════════════════════════════════════════════════════════
+# § GPG SMART PICKER  (passx gpg — jump straight to key action menu)
+# ════════════════════════════════════════════════════════════════
+cmd_gpg() {
+  _cmd="gpg"
+  command -v fzf >/dev/null 2>&1 || err "fzf required"
+  local keys; keys="$(list_entries | grep '^gpg/.*-pub$' | sed 's/-pub$//' || true)"
+  [ -z "${keys:-}" ] && {
+    info "No GPG keys stored.  Add one: passx gpg-add"
+    return 0
+  }
+  local chosen
+  chosen="$(printf "%s\n" "$keys" \
+    | _fzf_pick "gpg" "Your GPG keys — pick one")" || return 0
+  [ -z "${chosen:-}" ] && return 0
+
+  local action
+  action="$(printf "restore to keyring\ncopy public key\nshow public key\nremove from store" \
+    | _fzf_pick "gpg: $chosen" "Action" 25%)" || return 0
+
+  case "$action" in
+    "restore to keyring") cmd_gpg_set "$chosen" ;;
+    "copy public key")
+      pass show "${chosen}-pub" 2>/dev/null | copy_clipboard && ok "Public key copied" ;;
+    "show public key")
+      pass show "${chosen}-pub" 2>/dev/null; echo "" ;;
+    "remove from store") cmd_gpg_rm "$chosen" ;;
+  esac
+}
+
+# ════════════════════════════════════════════════════════════════
+# § USER-DEFINED TEMPLATES  (passx template-new)
+# ════════════════════════════════════════════════════════════════
+cmd_template_new() {
+  _cmd="template-new"
+  _banner "Create User Template"
+  printf "  Template name (e.g. vpn, aws-iam): " >&2; read -r tname </dev/tty || tname=""
+  [ -z "${tname:-}" ] && { dim "Aborted"; return 0; }
+  local tfile="$PASSX_TEMPLATES_DIR/${tname}"
+  if [ -f "$tfile" ]; then
+    printf "  Template '%s' exists. Overwrite? [y/N] " "$tname" >&2
+    read -r yn </dev/tty || yn=""; [ "${yn,,}" != "y" ] && { dim "Aborted"; return 0; }
+  fi
+  info "Define fields (one per line: 'field_name: prompt text')"
+  info "First field is always the password. Use 'password: label' to customise."
+  info "Example lines:"
+  dim "  username: AWS IAM username"
+  dim "  url: Console URL"
+  dim "  notes: Account purpose"
+  printf "\n  Enter fields (Ctrl-D when done):\n" >&2
+  local fields; fields="$(cat)"
+  [ -z "${fields:-}" ] && { dim "No fields entered"; return 0; }
+  mkdir -p "$PASSX_TEMPLATES_DIR"
+  printf "%s\n" "$fields" > "$tfile"
+  ok "Template saved: $tfile"
+  info "Use it: passx template $tname"
+}
+
+# ════════════════════════════════════════════════════════════════
+# § METADATA CACHE COMMAND  (passx meta-build)
+# ════════════════════════════════════════════════════════════════
+cmd_meta_build() {
+  _cmd="meta-build"
+  _banner "Building Metadata Cache"
+  info "Decrypting all entries to build URL/OTP/DB index..."
+  info "This runs once; subsequent searches will be instant."
+  local count=0 total
+  total="$(list_entries | wc -l)"
+  # Remove existing to force rebuild
+  rm -f "$(_meta_cache_file)"
+  while IFS= read -r e; do
+    [ -z "$e" ] && continue
+    count=$((count+1))
+    printf "  ${C_DIM}[%d/%d] %s${C_RESET}\r" "$count" "$total" "$e" >&2
+    local content; content="$(pass show "$e" 2>/dev/null)" || continue
+    local has_host=0 has_db=0 has_otp=0 url=""
+    printf "%s\n" "$content" | grep -qE "^host:"        && has_host=1
+    printf "%s\n" "$content" | grep -qE "^database:"    && has_db=1
+    printf "%s\n" "$content" | grep -qE "^otp:|^otpauth://" && has_otp=1
+    url="$(printf "%s\n" "$content" | grep -m1 "^url:" | sed "s/^url: *//")"
+    printf "%s\t%s\t%s\t%s\t%s\n" "$e" "$has_host" "$has_db" "$has_otp" "$url" \
+      >> "$(_meta_cache_file)"
+  done < <(list_entries)
+  printf "%-70s\r" "" >&2
+  ok "Metadata cache built ($count entries)"
+  info "Re-run after adding entries with URLs/DBs:  passx meta-build"
+}
+
+# ════════════════════════════════════════════════════════════════
+# § ALIAS SYSTEM
+# ════════════════════════════════════════════════════════════════
+_alias_file() { printf "%s/aliases" "$PASSX_CONF_DIR"; }
+
+_resolve_alias() {
+  local name="$1"
+  local file; file="$(_alias_file)"
+  [ -f "$file" ] || { printf "%s" "$name"; return; }
+  local resolved; resolved="$(grep -m1 "^${name}=" "$file" 2>/dev/null | cut -d= -f2- || true)"
+  [ -n "$resolved" ] && printf "%s" "$resolved" || printf "%s" "$name"
+}
+
+cmd_alias() {
+  _cmd="alias"
+  case "${1:-list}" in
+    add)
+      [ -z "${2:-}" ] || [ -z "${3:-}" ] && err "Usage: passx alias add <name> <path>"
+      local file; file="$(_alias_file)"
+      grep -v "^${2}=" "$file" 2>/dev/null > "${file}.tmp" && mv "${file}.tmp" "$file" || true
+      printf "%s=%s\n" "$2" "$3" >> "$file"; ok "Alias: $2 → $3" ;;
+    rm)
+      [ -z "${2:-}" ] && err "Usage: passx alias rm <name>"
+      local file; file="$(_alias_file)"
+      local tmp; tmp="$(mktemp)"
+      grep -v "^${2}=" "$file" 2>/dev/null > "$tmp" && mv "$tmp" "$file" || true
+      ok "Alias '$2' removed" ;;
+    list)
+      local file; file="$(_alias_file)"
+      [ -f "$file" ] || { info "No aliases defined."; return 0; }
+      _banner "Aliases"
+      while IFS='=' read -r name target; do
+        printf "  ${C_CYAN}%-20s${C_RESET} → %s\n" "$name" "$target"
+      done < "$file"; echo "" ;;
+    *) err "Usage: passx alias [add <name> <path> | rm <name> | list]" ;;
+  esac
+}
+
+# ════════════════════════════════════════════════════════════════
+# § PIN SYSTEM
+# ════════════════════════════════════════════════════════════════
+cmd_pin() {
+  _cmd="pin"
+  case "${1:-list}" in
+    add)
+      [ -z "${2:-}" ] && err "Usage: passx pin add <path>"
+      local file; file="$(_pin_file)"
+      grep -qxF "$2" "$file" 2>/dev/null && { info "Already pinned: $2"; return 0; }
+      printf "%s\n" "$2" >> "$file"; ok "Pinned: $2" ;;
+    rm)
+      [ -z "${2:-}" ] && err "Usage: passx pin rm <path>"
+      local file; file="$(_pin_file)"
+      local tmp; tmp="$(mktemp)"
+      grep -vxF "$2" "$file" > "$tmp" 2>/dev/null && mv "$tmp" "$file" || true
+      ok "Unpinned: $2" ;;
+    list)
+      local file; file="$(_pin_file)"
+      [ -f "$file" ] || { info "No pinned entries."; return 0; }
+      _banner "Pinned Entries"
+      while IFS= read -r e; do printf "  📌  %s\n" "$e"; done < "$file"; echo "" ;;
+    *) err "Usage: passx pin [add <path> | rm <path> | list]" ;;
+  esac
+}
+
+# ════════════════════════════════════════════════════════════════
+# § FRECENCY COMMAND
+# ════════════════════════════════════════════════════════════════
+cmd_frecency() {
+  _cmd="frecency"
+  case "${1:-list}" in
+    list)
+      _banner "Frecency Rankings"
+      local file; file="$(_frecency_file)"
+      [ -f "$file" ] || { info "No frecency data yet."; return; }
+      local i=1
+      while IFS=$'\t' read -r epoch count entry; do
+        local score; score="$(_frecency_score "$epoch" "$count")"
+        printf "  ${C_CYAN}%3d${C_RESET}  ${C_BOLD}%-38s${C_RESET}  accesses:%-4s  score:%.2f\n" \
+          "$i" "$entry" "$count" "$score"
+        i=$((i+1)); [ $i -gt 30 ] && break
+      done < <(sort -t$'\t' -k1 -rn "$file" 2>/dev/null) ;;
+    reset)
+      if [ -n "${2:-}" ]; then
+        local file; file="$(_frecency_file)"; local tmp; tmp="$(mktemp)"
+        grep -v "	${2}$" "$file" > "$tmp" 2>/dev/null && mv "$tmp" "$file" || true
+        ok "Reset frecency for $2"
+      else
+        rm -f "$(_frecency_file)"; ok "Frecency data cleared"
+      fi ;;
+    *) err "Usage: passx frecency [list|reset [path]]" ;;
+  esac
+}
+
+# ════════════════════════════════════════════════════════════════
+# § WHERE — reverse domain lookup
+# ════════════════════════════════════════════════════════════════
+cmd_where() {
+  _cmd="where"
+  local query="${1:-}" do_copy=false do_fill=false
+  shift 2>/dev/null || true
+  while [ "$#" -gt 0 ]; do
+    case "$1" in --copy|-c) do_copy=true ;; --fill|-f) do_fill=true ;; esac; shift
+  done
+  [ -z "$query" ] && { printf "  Search domain or keyword: " >&2; read -r query </dev/tty; }
+  [ -z "${query:-}" ] && err "No search query"
+  local domain; domain="$(printf "%s" "$query" | sed 's|https\?://||; s|/.*||')"
+  local -a results=()
+  local mcache; mcache="$(_meta_cache_file)"
+  if [ -f "$mcache" ]; then
+    # Fast path: scan URL column in metadata cache
+    while IFS=$'\t' read -r entry _ _ _ url; do
+      [[ "$url" == *"$domain"* ]] && results+=("$entry")
+    done < "$mcache"
+  else
+    info "Building URL index (first run)..."
+    while IFS= read -r entry; do
+      [ -z "$entry" ] && continue
+      local content; content="$(pass show "$entry" 2>/dev/null)" || continue
+      local url; url="$(printf "%s\n" "$content" | grep -m1 "^url:" | sed "s/^url: *//" || true)"
+      [[ "$url" == *"$domain"* ]] && results+=("$entry")
+    done < <(list_entries)
+  fi
+  if [ ${#results[@]} -eq 0 ]; then info "No entries matching '${domain}'"; return 0; fi
+  printf "\n  ${C_BOLD}Found %d match(es):${C_RESET}\n\n" "${#results[@]}"
+  for r in "${results[@]}"; do
+    local url; url="$(_meta_lookup "$r" url 2>/dev/null || pass show "$r" 2>/dev/null | grep -m1 "^url:" | sed "s/^url: *//"; true)"
+    printf "  ${C_CYAN}%-38s${C_RESET}  ${C_DIM}%s${C_RESET}\n" "$r" "$url"
+  done; echo ""
+  if $do_copy || $do_fill; then
+    local chosen="${results[0]}"
+    [ ${#results[@]} -gt 1 ] && chosen="$(printf "%s\n" "${results[@]}" | _fzf_pick "where" "Select entry")" || true
+    [ -z "${chosen:-}" ] && return 0
+    $do_copy && { extract_field "$chosen" password | tr -d '\n' | copy_clipboard --silent
+      _clip_log "$chosen" password; ok "Password copied"; }
+    $do_fill && cmd_fill "$chosen"
+  fi
+}
+
+# ════════════════════════════════════════════════════════════════
+# § FIND — full-text search across decrypted content
+# ════════════════════════════════════════════════════════════════
+cmd_find() {
+  _cmd="find"
+  local query="" field=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --field|-f) field="${2:-}"; shift ;;
+      --url)      field="url" ;;
+      --help|-h)
+        printf "\n${C_BOLD}passx find${C_RESET} <query> [--field <field>]\n\n"
+        printf "  Full-text search across all decrypted entries.\n\n"; return 0 ;;
+      -*) err "Unknown flag: $1" ;;
+      *) query="$1" ;;
+    esac; shift
+  done
+  [ -z "$query" ] && err "Usage: passx find <query> [--field <field>]"
+  info "Searching all entries (requires decryption)..."
+  local results=0 total=0
+  while IFS= read -r entry; do
+    [ -z "$entry" ] && continue; total=$((total+1))
+    local content; content="$(pass show "$entry" 2>/dev/null)" || continue
+    local hit=false
+    if [ -n "$field" ]; then
+      local val; val="$(printf "%s\n" "$content" | grep -m1 "^${field}:" | sed "s/^${field}: *//")"
+      [[ "$val" == *"$query"* ]] && hit=true
+    else
+      [[ "$content" == *"$query"* ]] && hit=true
+    fi
+    if $hit; then
+      results=$((results+1))
+      local matched; matched="$(printf "%s\n" "$content" | grep -m1 "$query" | head -c 60 || true)"
+      printf "  ${C_CYAN}%-38s${C_RESET}  ${C_DIM}%s${C_RESET}\n" "$entry" "$matched"
+    fi
+    [ $((total % 10)) -eq 0 ] && printf "  ${C_DIM}Scanned %d...${C_RESET}\r" "$total" >&2
+  done < <(list_entries)
+  printf "%-60s\r" "" >&2; echo ""
+  [ $results -eq 0 ] && info "No matches for '$query'" \
+                      || info "Found $results / $total entries"
+}
+
+# ════════════════════════════════════════════════════════════════
+# § HISTORY — per-entry git log
+# ════════════════════════════════════════════════════════════════
+cmd_history() {
+  _cmd="history"; _need_git
+  local path="${1:-}"
+  path="$(_resolve_alias "${path:-}")"
+  [ -z "$path" ] && path="$(list_entries | _fzf_pick "history" "Select entry")" || true
+  [ -z "${path:-}" ] && err "No entry selected"
+  _banner "History: $path"
+  cd "$PASSWORD_STORE_DIR" && git log --follow \
+    --format="%C(dim)%ai%Creset  %s" -- "${path}.gpg" 2>/dev/null \
+    | sed 's/ +[^ ]*//' | sed 's/^/  /'
+  echo ""
+}
+
+# ════════════════════════════════════════════════════════════════
+# § STALE WARNING ON COPY
+# ════════════════════════════════════════════════════════════════
+_warn_stale() {
+  [ "$PASSX_WARN_STALE" = "true" ] || return 0
+  local entry="$1"; [ -d "$PASSWORD_STORE_DIR/.git" ] || return 0
+  local lc days
+  lc="$(cd "$PASSWORD_STORE_DIR" && git log -1 --format="%ct" -- "${entry}.gpg" 2>/dev/null || echo 0)"
+  [ "${lc:-0}" -eq 0 ] && return 0
+  days=$(( ($(date +%s) - lc) / 86400 ))
+  [ "$days" -gt "$PASSX_MAX_AGE" ] && \
+    warn "Last rotated ${days} days ago — consider: passx rotate ${entry}"
+}
+
+# ════════════════════════════════════════════════════════════════
+# § SNIP — single-decryption structured output for scripting
+# ════════════════════════════════════════════════════════════════
+cmd_snip() {
+  _cmd="snip"
+  local path="${1:-}" format="${2:-export}"
+  path="$(_resolve_alias "${path:-}")"
+  [ -z "$path" ] && path="$(list_entries | _fzf_pick "snip" "Select entry")" || true
+  [ -z "${path:-}" ] && err "No entry selected"
+  local e; e="$(pass show "$path" 2>/dev/null)" || err "Cannot decrypt: $path"
+  local pw user email host port db token url
+  pw="$(printf "%s\n" "$e"    | sed -n '1p')"
+  user="$(printf "%s\n" "$e"  | grep -m1 "^username:" | sed "s/^username: *//")"
+  email="$(printf "%s\n" "$e" | grep -m1 "^email:"    | sed "s/^email: *//")"
+  host="$(printf "%s\n" "$e"  | grep -m1 "^host:"     | sed "s/^host: *//")"
+  port="$(printf "%s\n" "$e"  | grep -m1 "^port:"     | sed "s/^port: *//")"
+  db="$(printf "%s\n" "$e"    | grep -m1 "^database:" | sed "s/^database: *//")"
+  token="$(printf "%s\n" "$e" | grep -m1 "^token:"    | sed "s/^token: *//")"
+  url="$(printf "%s\n" "$e"   | grep -m1 "^url:"      | sed "s/^url: *//")"
+  local pfx; pfx="$(printf "%s" "${path}" | tr '[:lower:]/' '[:upper:]_')_"
+  case "$format" in
+    dotenv)
+      [ -n "$pw"    ] && printf "PASSWORD=%s\n"   "$pw"
+      [ -n "$user"  ] && printf "USERNAME=%s\n"   "$user"
+      [ -n "$email" ] && printf "EMAIL=%s\n"      "$email"
+      [ -n "$host"  ] && printf "HOST=%s\n"       "$host"
+      [ -n "$port"  ] && printf "PORT=%s\n"       "$port"
+      [ -n "$db"    ] && printf "DATABASE=%s\n"   "$db"
+      [ -n "$token" ] && printf "TOKEN=%s\n"      "$token"
+      [ -n "$url"   ] && printf "URL=%s\n"        "$url" ;;
+    *)
+      [ -n "$pw"    ] && printf "export PASSX_PASSWORD='%s'\n"  "$pw"
+      [ -n "$user"  ] && printf "export PASSX_USERNAME='%s'\n"  "$user"
+      [ -n "$email" ] && printf "export PASSX_EMAIL='%s'\n"     "$email"
+      [ -n "$host"  ] && printf "export PASSX_HOST='%s'\n"      "$host"
+      [ -n "$port"  ] && printf "export PASSX_PORT='%s'\n"      "$port"
+      [ -n "$db"    ] && printf "export PASSX_DATABASE='%s'\n"  "$db"
+      [ -n "$token" ] && printf "export PASSX_TOKEN='%s'\n"     "$token"
+      [ -n "$url"   ] && printf "export PASSX_URL='%s'\n"       "$url"
+      [ -n "$pw"    ] && printf "export %sPASSWORD='%s'\n"  "$pfx" "$pw"
+      [ -n "$user"  ] && printf "export %sUSERNAME='%s'\n"  "$pfx" "$user"
+      [ -n "$token" ] && printf "export %sTOKEN='%s'\n"     "$pfx" "$token" ;;
+  esac
+}
+
+# ════════════════════════════════════════════════════════════════
+# § DATABASE MODE
+# ════════════════════════════════════════════════════════════════
+# ── Metadata cache: stores has_db, has_otp, url per entry ────────
+_meta_cache_file() { printf "%s/metadata" "$PASSX_CACHE_DIR"; }
+
+_build_meta_cache() {
+  local mcache; mcache="$(_meta_cache_file)"
+  # Only rebuild if entry cache is newer than meta cache
+  local ecache; ecache="$(_cache_file)"
+  if [ -f "$mcache" ] && [ -f "$ecache" ] && [ "$mcache" -nt "$ecache" ]; then
+    return 0
+  fi
+  mkdir -p "$PASSX_CACHE_DIR"
+  : > "$mcache"
+  while IFS= read -r e; do
+    [ -z "$e" ] && continue
+    local content; content="$(pass show "$e" 2>/dev/null)" || continue
+    local has_host=0 has_db=0 has_otp=0 url=""
+    printf "%s\n" "$content" | grep -qE "^host:"     && has_host=1
+    printf "%s\n" "$content" | grep -qE "^database:" && has_db=1
+    printf "%s\n" "$content" | grep -qE "^otp:|^otpauth://" && has_otp=1
+    url="$(printf "%s\n" "$content" | grep -m1 "^url:" | sed "s/^url: *//")"
+    printf "%s\t%s\t%s\t%s\t%s\n" "$e" "$has_host" "$has_db" "$has_otp" "$url" >> "$mcache"
+  done < <(list_entries)
+}
+
+_meta_lookup() {
+  # _meta_lookup <entry> <field: has_host|has_db|has_otp|url>
+  local entry="$1" field="$2"
+  local mcache; mcache="$(_meta_cache_file)"
+  [ -f "$mcache" ] || return 1
+  local row; row="$(grep -m1 "^${entry}	" "$mcache" 2>/dev/null || true)"
+  [ -z "$row" ] && return 1
+  case "$field" in
+    has_host) printf "%s" "$(printf "%s" "$row" | cut -f2)" ;;
+    has_db)   printf "%s" "$(printf "%s" "$row" | cut -f3)" ;;
+    has_otp)  printf "%s" "$(printf "%s" "$row" | cut -f4)" ;;
+    url)      printf "%s" "$(printf "%s" "$row" | cut -f5)" ;;
+  esac
+}
+
+_db_entries() {
+  # Fast path: use metadata cache if available
+  local mcache; mcache="$(_meta_cache_file)"
+  if [ -f "$mcache" ]; then
+    awk -F'\t' '($2=="1" || $3=="1") {print $1}' "$mcache" 2>/dev/null
+    return
+  fi
+  # Slow path: decrypt each entry (and build cache for next time)
+  while IFS= read -r e; do
+    [ -z "$e" ] && continue
+    local content; content="$(pass show "$e" 2>/dev/null)" || continue
+    printf "%s\n" "$content" | grep -qE "^(host|database):" && printf "%s\n" "$e" || true
+  done < <(list_entries)
+}
+
+_db_detect_type() {
+  local port="${1:-}" type_field="${2:-}"
+  case "${type_field,,}" in
+    postgres*|pg|postgresql) printf "postgres"; return ;;
+    mysql*|mariadb*)         printf "mysql";    return ;;
+    redis*)                  printf "redis";    return ;;
+    mongo*)                  printf "mongo";    return ;;
+    sqlite*)                 printf "sqlite";   return ;;
+  esac
+  case "$port" in
+    5432)  printf "postgres" ;;
+    3306)  printf "mysql"    ;;
+    6379)  printf "redis"    ;;
+    27017) printf "mongo"    ;;
+    *)     printf "unknown"  ;;
+  esac
+}
+
+_db_client_for() {
+  local dbtype="$1"
+  [ "$PASSX_DB_CLIENT" != "auto" ] && { printf "%s" "$PASSX_DB_CLIENT"; return; }
+  case "$dbtype" in
+    postgres) for c in pgcli psql;      do command -v "$c" >/dev/null 2>&1 && { printf "%s" "$c"; return; }; done ;;
+    mysql)    for c in mycli mysql mariadb; do command -v "$c" >/dev/null 2>&1 && { printf "%s" "$c"; return; }; done ;;
+    redis)    command -v redis-cli >/dev/null 2>&1 && printf "redis-cli" ;;
+    mongo)    for c in mongosh mongo;   do command -v "$c" >/dev/null 2>&1 && { printf "%s" "$c"; return; }; done ;;
+    sqlite)   command -v sqlite3 >/dev/null 2>&1 && printf "sqlite3" ;;
+  esac
+}
+
+cmd_db() {
+  _cmd="db"
+  local subcmd="${1:-list}"; shift 2>/dev/null || true
+
+  case "$subcmd" in
+    list|"")
+      _banner "Database Entries"
+      local found=false
+      while IFS= read -r e; do
+        [ -z "$e" ] && continue
+        # Decrypt only this one entry for display
+        local entry; entry="$(pass show "$e" 2>/dev/null)" || continue
+        local host db port type_field
+        host="$(printf "%s\n" "$entry" | grep -m1 "^host:"     | sed "s/^host: *//")"
+        db="$(printf "%s\n"   "$entry" | grep -m1 "^database:" | sed "s/^database: *//")"
+        port="$(printf "%s\n" "$entry" | grep -m1 "^port:"     | sed "s/^port: *//")"
+        type_field="$(printf "%s\n" "$entry" | grep -m1 "^type:" | sed "s/^type: *//")"
+        local dbtype; dbtype="$(_db_detect_type "${port:-}" "${type_field:-}")"
+        printf "  ${C_CYAN}%-38s${C_RESET}  ${C_BOLD}%-10s${C_RESET}  %s%s%s\n" \
+          "$e" "$dbtype" "$host" "${port:+:$port}" "${db:+/$db}"
+        found=true
+      done < <(_db_entries)
+      $found || info "No database entries. Add one:  passx template database"
+      echo "" ;;
+
+    connect|shell)
+      local path="${1:-}"
+      path="$(_resolve_alias "${path:-}")"
+      if [ -z "$path" ]; then
+        local _dbl; _dbl="$(_db_entries)"
+        [ -z "${_dbl:-}" ] && err "No database entries found"
+        path="$(printf "%s\n" "$_dbl" | _fzf_pick "db" "Select database")" || return 0
+      fi
+      [ -z "${path:-}" ] && err "No entry selected"
+      local e; e="$(pass show "$path" 2>/dev/null)" || err "Cannot decrypt"
+      local pw user host port db type_field
+      pw="$(printf "%s\n" "$e"         | sed -n '1p')"
+      user="$(printf "%s\n" "$e"       | grep -m1 "^username:" | sed "s/^username: *//")"
+      host="$(printf "%s\n" "$e"       | grep -m1 "^host:"     | sed "s/^host: *//")"
+      port="$(printf "%s\n" "$e"       | grep -m1 "^port:"     | sed "s/^port: *//")"
+      db="$(printf "%s\n" "$e"         | grep -m1 "^database:" | sed "s/^database: *//")"
+      type_field="$(printf "%s\n" "$e" | grep -m1 "^type:"     | sed "s/^type: *//")"
+      [ -z "$host" ] && err "No host field in $path"
+      local dbtype; dbtype="$(_db_detect_type "${port:-5432}" "${type_field:-}")"
+      local client; client="$(_db_client_for "$dbtype")"
+      [ -z "$client" ] && err "No client found for $dbtype. Install: pgcli/psql/mycli/mysql/redis-cli/mongosh"
+      info "Connecting: ${user:+${user}@}${host}${port:+:$port}${db:+/$db}  [${dbtype}/${client}]"
+      case "$dbtype" in
+        postgres) PGPASSWORD="$pw" "$client" \
+            -h "$host" ${port:+-p "$port"} ${user:+-U "$user"} ${db:+-d "$db"} ;;
+        mysql)
+          if [[ "$client" == "mycli" ]]; then
+            mycli -h "$host" ${port:+-P "$port"} ${user:+-u "$user"} --password="$pw" ${db:-}
+          else
+            mysql -h "$host" ${port:+-P "$port"} ${user:+-u "$user"} -p"$pw" ${db:-}
+          fi ;;
+        redis)
+          [ -n "$pw" ] && redis-cli -h "${host:-127.0.0.1}" ${port:+-p "$port"} -a "$pw" \
+                       || redis-cli -h "${host:-127.0.0.1}" ${port:+-p "$port"} ;;
+        mongo)
+          local mongo_url="mongodb://${user:+${user}:${pw}@}${host}${port:+:$port}${db:+/$db}"
+          "$client" "$mongo_url" ;;
+        sqlite) sqlite3 "${db:-$host}" ;;
+        *) err "Unsupported database type: $dbtype" ;;
+      esac ;;
+
+    query)
+      local path="${1:-}"; shift 2>/dev/null || true
+      path="$(_resolve_alias "${path:-}")"
+      local sql="${1:-}"
+      [ -z "$path" ] && err "Usage: passx db query <path> <SQL>"
+      [ -z "$sql" ] && { printf "  SQL: " >&2; read -r sql </dev/tty; }
+      [ -z "${sql:-}" ] && err "No SQL provided"
+      local e; e="$(pass show "$path" 2>/dev/null)" || err "Cannot decrypt"
+      local pw user host port db type_field
+      pw="$(printf "%s\n" "$e"         | sed -n '1p')"
+      user="$(printf "%s\n" "$e"       | grep -m1 "^username:" | sed "s/^username: *//")"
+      host="$(printf "%s\n" "$e"       | grep -m1 "^host:"     | sed "s/^host: *//")"
+      port="$(printf "%s\n" "$e"       | grep -m1 "^port:"     | sed "s/^port: *//")"
+      db="$(printf "%s\n" "$e"         | grep -m1 "^database:" | sed "s/^database: *//")"
+      type_field="$(printf "%s\n" "$e" | grep -m1 "^type:"     | sed "s/^type: *//")"
+      local dbtype; dbtype="$(_db_detect_type "${port:-5432}" "${type_field:-}")"
+      case "$dbtype" in
+        postgres) PGPASSWORD="$pw" psql -h "$host" ${port:+-p "$port"} \
+                    ${user:+-U "$user"} ${db:+-d "$db"} -c "$sql" ;;
+        mysql)    mysql -h "$host" ${port:+-P "$port"} ${user:+-u "$user"} \
+                    -p"$pw" ${db:-} -e "$sql" ;;
+        sqlite)   sqlite3 "${db:-$host}" "$sql" ;;
+        *) err "passx db query not supported for $dbtype" ;;
+      esac ;;
+
+    tunnel)
+      local path="${1:-}"
+      [ -z "$path" ] && path="$(_db_entries | _fzf_pick "db tunnel" "Select DB")" || true
+      [ -z "${path:-}" ] && err "No entry"
+      local e; e="$(pass show "$path" 2>/dev/null)" || err "Cannot decrypt"
+      local host port
+      host="$(printf "%s\n" "$e" | grep -m1 "^host:" | sed "s/^host: *//")"
+      port="$(printf "%s\n" "$e" | grep -m1 "^port:" | sed "s/^port: *//")"
+      printf "  SSH jump host (user@host): " >&2; read -r jump </dev/tty
+      [ -z "${jump:-}" ] && err "No jump host"
+      local local_port=$(( ${port:-5432} + 10000 ))
+      step "SSH tunnel: localhost:${local_port} → ${host}:${port:-5432}  (Ctrl-C to close)"
+      ssh -NL "${local_port}:${host}:${port:-5432}" "$jump" ;;
+
+    --help|-h) printf "\n${C_BOLD}passx db${C_RESET} [list|connect|query|tunnel] [path]\n\n"
+      printf "  Manages database entries with auto-detected clients.\n"
+      printf "  Supports: postgres, mysql, redis, mongo, sqlite\n\n"
+      printf "  Clients used (auto-detect or PASSX_DB_CLIENT):\n"
+      printf "    postgres → pgcli or psql\n    mysql    → mycli or mysql\n"
+      printf "    redis    → redis-cli\n    mongo    → mongosh or mongo\n\n" ;;
+    *) err "Usage: passx db [list|connect|query|tunnel] [path]" ;;
+  esac
+}
+
+# ════════════════════════════════════════════════════════════════
+# § ATTACHMENTS
+# ════════════════════════════════════════════════════════════════
+cmd_attach() {
+  _cmd="attach"
+  local subcmd="${1:-ls}"; shift 2>/dev/null || true
+  case "$subcmd" in
+    add)
+      local path="${1:-}" file="${2:-}"
+      [ -z "$path" ] && path="$(list_entries | _fzf_pick "attach" "Select entry")" || true
+      [ -z "${path:-}" ] && err "No entry"
+      [ -z "$file" ] && { printf "  File to attach: " >&2; read -r file </dev/tty; }
+      file="${file/#\~/$HOME}"; [ ! -f "$file" ] && err "File not found: $file"
+      local fname; fname="$(basename "$file")"
+      local gpg_id; gpg_id="$(head -1 "$PASSWORD_STORE_DIR/.gpg-id" 2>/dev/null)"
+      [ -z "${gpg_id:-}" ] && err "Cannot read .gpg-id from store"
+      _gpg_env
+      gpg --encrypt --recipient "$gpg_id" \
+        --output "$PASSWORD_STORE_DIR/${path}.attach.${fname}.gpg" "$file" 2>/dev/null \
+        || err "Encryption failed"
+      [ -d "$PASSWORD_STORE_DIR/.git" ] && {
+        cd "$PASSWORD_STORE_DIR"
+        git add "${path}.attach.${fname}.gpg" 2>/dev/null
+        git commit -m "attach: ${fname} to ${path}" 2>/dev/null || true
+      }
+      ok "Attached: $fname → $path"; _autosync ;;
+    get)
+      local path="${1:-}" fname="${2:-}"
+      [ -z "$path" ] && path="$(list_entries | _fzf_pick "attach get" "Select entry")" || true
+      [ -z "${path:-}" ] && err "No entry"
+      if [ -z "$fname" ]; then
+        local -a attachments=()
+        while IFS= read -r f; do
+          attachments+=("$(basename "$f" .gpg | sed "s/^${path}.attach.//")")
+        done < <(find "$PASSWORD_STORE_DIR" -name "${path}.attach.*.gpg" 2>/dev/null)
+        [ ${#attachments[@]} -eq 0 ] && err "No attachments for $path"
+        fname="$(printf "%s\n" "${attachments[@]}" | _fzf_pick "attach get" "Select attachment")"
+      fi
+      [ -z "${fname:-}" ] && err "No attachment"
+      gpg --decrypt "$PASSWORD_STORE_DIR/${path}.attach.${fname}.gpg" 2>/dev/null \
+        || err "Decryption failed" ;;
+    ls)
+      local path="${1:-}"
+      [ -z "$path" ] && path="$(list_entries | _fzf_pick "attach ls" "Select entry")" || true
+      [ -z "${path:-}" ] && err "No entry"
+      local found=false
+      while IFS= read -r f; do
+        printf "  📎  %s\n" "$(basename "$f" .gpg | sed "s/^.*\.attach\.//")"
+        found=true
+      done < <(find "$PASSWORD_STORE_DIR" -name "${path}.attach.*.gpg" 2>/dev/null)
+      $found || info "No attachments for $path" ;;
+    rm)
+      local path="${1:-}" fname="${2:-}"
+      [ -z "$path" ] || [ -z "$fname" ] && err "Usage: passx attach rm <path> <filename>"
+      local f="$PASSWORD_STORE_DIR/${path}.attach.${fname}.gpg"
+      [ -f "$f" ] || err "Not found: $fname"
+      printf "  Remove '%s' from '%s'? [y/N] " "$fname" "$path" >&2
+      read -r yn </dev/tty || yn=""; [ "${yn,,}" != "y" ] && { dim "Aborted"; return 0; }
+      rm -f "$f"
+      [ -d "$PASSWORD_STORE_DIR/.git" ] && {
+        cd "$PASSWORD_STORE_DIR"
+        git rm -f "${path}.attach.${fname}.gpg" 2>/dev/null
+        git commit -m "rm-attach: ${fname} from ${path}" 2>/dev/null || true
+      }
+      ok "Removed: $fname"; _autosync ;;
+    *) err "Usage: passx attach [add|get|ls|rm] <path> [file]" ;;
+  esac
+}
+
+
+# ════════════════════════════════════════════════════════════════
+# § VAULT — multiple independent password stores
+# ════════════════════════════════════════════════════════════════
+# Each vault = ~/.config/passx/vaults/NAME  containing:
+#   export PASSWORD_STORE_DIR="/path/to/store"
+# Sourced at startup. Clean, no exec-self tricks.
+# ════════════════════════════════════════════════════════════════
+_vault_dir()   { printf "%s/vaults" "$PASSX_CONF_DIR"; }
+_active_file() { printf "%s/active_vault" "$PASSX_CACHE_DIR"; }
+
+_vault_store_dir() {
+  # Read store path from vault config without sourcing it
+  local vfile; vfile="$(_vault_dir)/${1}"
+  [ -f "$vfile" ] || { printf ""; return; }
+  awk -F= '/^export PASSWORD_STORE_DIR=/{
+    v=$2; gsub(/^[ \t"'"'"']+|[ \t"'"'"']+$/, "", v)
+    home=ENVIRON["HOME"]; sub(/^~/, home, v)
+    print v; exit
+  }' "$vfile" 2>/dev/null || true
+}
+
+cmd_vault() {
+  _cmd="vault"
+  local subcmd="${1:-list}"; shift 2>/dev/null || true
+  local vdir; vdir="$(_vault_dir)"
+  mkdir -p "$vdir"
+
+  case "$subcmd" in
+    list)
+      _banner "Password Vaults"
+      local active; active="$(cat "$(_active_file)" 2>/dev/null || true)"
+      local marker; marker=""
+      [ -z "$active" ] && marker="  ${C_GREEN}(active)${C_RESET}"
+      printf "  ${C_CYAN}%-20s${C_RESET}  %-38s%b\n" \
+        "default" "${PASSWORD_STORE_DIR:-$HOME/.password-store}" "$marker"
+      for f in "$vdir"/*; do
+        [ -f "$f" ] || continue
+        local vname; vname="$(basename "$f")"
+        local vstore; vstore="$(_vault_store_dir "$vname")"
+        marker=""
+        [ "$vname" = "$active" ] && marker="  ${C_GREEN}(active)${C_RESET}"
+        local cnt; cnt=""
+        if [ -d "${vstore:-}" ]; then
+          cnt=$(find "$vstore" -name "*.gpg" 2>/dev/null | wc -l)
+          cnt="  ${C_DIM}(${cnt} entries)${C_RESET}"
+        fi
+        printf "  ${C_CYAN}%-20s${C_RESET}  %-38s%b%b\n" \
+          "$vname" "${vstore:-?}" "$marker" "$cnt"
+      done
+      echo "" ;;
+
+    add|create|new)
+      local vname="${1:-}"
+      [ -z "$vname" ] && { printf "  Vault name (e.g. work, personal): " >&2
+        read -r vname </dev/tty; }
+      [ -z "${vname:-}" ] && err "No vault name"
+      [[ "$vname" =~ ^[a-zA-Z0-9_-]+$ ]] \
+        || err "Name must be alphanumeric / dash / underscore only"
+      [ -f "$vdir/$vname" ] && { warn "Vault '$vname' already exists"; return 0; }
+      local vdef="$HOME/.password-store-${vname}"
+      printf "  Store path [%s]: " "$vdef" >&2; read -r vstore </dev/tty
+      vstore="${vstore:-$vdef}"; vstore="${vstore/#\~/$HOME}"
+      # Write vault config — plain shell, sourced at startup
+      {
+        printf "# passx vault: %s\n" "$vname"
+        printf "export PASSWORD_STORE_DIR=\"%s\"\n" "$vstore"
+        printf "# Uncomment to override per-vault:\n"
+        printf "# export PASSX_CLIP_TIMEOUT=30\n"
+        printf "# export PASSX_AUTOSYNC=true\n"
+      } > "$vdir/$vname"
+      ok "Vault config created: $vdir/$vname"
+      printf "  Initialize password store now? [Y/n] " >&2
+      read -r yn </dev/tty || yn="y"
+      if [ "${yn,,}" != "n" ]; then
+        printf "  GPG key ID(s) (space-separated): " >&2
+        read -r gpg_keys </dev/tty
+        [ -z "${gpg_keys:-}" ] && err "GPG key required"
+        mkdir -p "$vstore"
+        PASSWORD_STORE_DIR="$vstore" pass init $gpg_keys \
+          && ok "Store initialized: $vstore" \
+          || err "pass init failed — check your GPG key ID"
+        printf "  Set up git remote? [y/N] " >&2; read -r yn </dev/tty || yn="n"
+        if [ "${yn,,}" = "y" ]; then
+          printf "  Git remote SSH URL: " >&2; read -r remote </dev/tty
+          if [ -n "${remote:-}" ]; then
+            PASSWORD_STORE_DIR="$vstore" pass git init
+            PASSWORD_STORE_DIR="$vstore" pass git remote add origin "$remote"
+            ok "Git remote: $remote"
+          fi
+        fi
+      fi
+      printf "  Switch to this vault now? [y/N] " >&2; read -r yn </dev/tty || yn="n"
+      [ "${yn,,}" = "y" ] && cmd_vault switch "$vname" ;;
+
+    switch|activate)
+      local vname="${1:-}"
+      if [ -z "$vname" ]; then
+        local opts; opts="default"
+        for f in "$vdir"/*; do [ -f "$f" ] && opts+=$'\n'"$(basename "$f")"; done
+        vname="$(printf "%s" "$opts" \
+          | _fzf_pick "vault" "Switch to vault" 30%)" || return 0
+      fi
+      if [ -z "$vname" ] || [ "$vname" = "default" ]; then
+        rm -f "$(_active_file)"
+        ok "Switched to default vault  (${HOME}/.password-store)"
+      else
+        [ -f "$vdir/$vname" ] \
+          || err "Vault '$vname' not found. List: passx vault list"
+        local vstore; vstore="$(_vault_store_dir "$vname")"
+        [ -d "${vstore:-}" ] \
+          || warn "Store directory missing: $vstore  (run: passx vault add $vname)"
+        printf "%s" "$vname" > "$(_active_file)"
+        ok "Switched to: ${C_BOLD}${vname}${C_RESET}  (${vstore})"
+        dim "Active in new shells. For this shell:"
+        dim "  export PASSWORD_STORE_DIR=\"${vstore}\""
+      fi
+      _invalidate_cache ;;
+
+    env)
+      # Print export statements: eval \$(passx vault env) or source <(passx vault env)
+      local vname="${1:-$(cat "$(_active_file)" 2>/dev/null || true)}"
+      if [ -z "$vname" ]; then
+        printf "export PASSWORD_STORE_DIR='%s'\n" "${HOME}/.password-store"
+        return 0
+      fi
+      [ -f "$vdir/$vname" ] || err "Vault '$vname' not found"
+      grep "^export " "$vdir/$vname" ;;
+
+    use)
+      # One-off: run a passx command in a specific vault without switching
+      # Usage: passx vault use VAULTNAME [--] COMMAND [ARGS...]
+      local vname="${1:-}"; shift 2>/dev/null || true
+      [ -z "$vname" ] \
+        && err "Usage: passx vault use <n> [--] <command> [args...]"
+      [ "${1:-}" = "--" ] && shift
+      [ -z "${1:-}" ] && err "No command specified"
+      local vstore
+      if [ "$vname" = "default" ]; then
+        vstore="${HOME}/.password-store"
+      else
+        [ -f "$vdir/$vname" ] \
+          || err "Vault '$vname' not found. Run: passx vault list"
+        vstore="$(_vault_store_dir "$vname")"
+        [ -n "${vstore:-}" ] \
+          || err "Cannot read PASSWORD_STORE_DIR from: $vdir/$vname"
+      fi
+      PASSWORD_STORE_DIR="$vstore" exec "$0" "$@" ;;
+
+    rm|remove|delete)
+      local vname="${1:-}"
+      [ -z "$vname" ] && vname="$(ls "$vdir" 2>/dev/null \
+        | _fzf_pick "vault rm" "Select vault to remove" 30%)" || true
+      [ -z "${vname:-}" ] && err "No vault selected"
+      [ "$vname" = "default" ] && err "Cannot remove the default vault"
+      local vstore; vstore="$(_vault_store_dir "$vname")"
+      printf "\n  ${C_YELLOW}Remove vault config '%s'?${C_RESET} [y/N]\n" "$vname" >&2
+      printf "  ${C_DIM}Store at %s is NOT touched.${C_RESET}\n  " "${vstore:-?}" >&2
+      read -r yn </dev/tty || yn=""
+      [ "${yn,,}" != "y" ] && { dim "Aborted"; return 0; }
+      rm -f "$vdir/$vname"
+      local cur; cur="$(cat "$(_active_file)" 2>/dev/null || true)"
+      [ "$cur" = "$vname" ] && rm -f "$(_active_file)"
+      ok "Vault config '$vname' removed (store files untouched)" ;;
+
+    status)
+      _banner "Vault Sync Status"
+      local active; active="$(cat "$(_active_file)" 2>/dev/null || echo default)"
+      local all; all="default"
+      for f in "$vdir"/*; do
+        [ -f "$f" ] && all+=" $(basename "$f")"
+      done
+      for vname in $all; do
+        local vstore
+        if [ "$vname" = "default" ]; then
+          vstore="${HOME}/.password-store"
+        else
+          vstore="$(_vault_store_dir "$vname")"
+        fi
+        local bullet; bullet="  "
+        [ "$vname" = "$active" ] && bullet="${C_GREEN}▶${C_RESET} "
+        printf "  %b${C_BOLD}%-20s${C_RESET}  " "$bullet" "$vname"
+        if [ ! -d "${vstore:-}" ]; then
+          printf "${C_RED}store missing${C_RESET}\n"
+        elif [ -d "${vstore}/.git" ]; then
+          local branch ahead behind
+          branch="$(cd "$vstore" \
+            && git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+          ahead="$(cd "$vstore" \
+            && git rev-list --count "@{u}..HEAD" 2>/dev/null || echo '?')"
+          behind="$(cd "$vstore" \
+            && git rev-list --count "HEAD..@{u}" 2>/dev/null || echo '?')"
+          if [ "$ahead" = "?" ]; then
+            printf "${C_DIM}%s (no remote)${C_RESET}\n" "$branch"
+          elif [ "$ahead" = "0" ] && [ "$behind" = "0" ]; then
+            printf "${C_GREEN}%s up to date${C_RESET}\n" "$branch"
+          else
+            printf "${C_YELLOW}%s  ahead:%s  behind:%s${C_RESET}\n" \
+              "$branch" "$ahead" "$behind"
+          fi
+        else
+          printf "${C_DIM}no git${C_RESET}\n"
+        fi
+      done
+      echo "" ;;
+
+    prompt)
+      local active; active="$(cat "$(_active_file)" 2>/dev/null || true)"
+      [ -n "$active" ] && printf "[%s] " "$active" ;;
+
+    edit)
+      local vname="${1:-$(cat "$(_active_file)" 2>/dev/null || true)}"
+      [ -z "$vname" ] \
+        && err "No active vault. Usage: passx vault edit <name>"
+      [ -f "$vdir/$vname" ] || err "Vault '$vname' not found"
+      local ed; ed="${EDITOR:-${VISUAL:-vi}}"
+      "$ed" "$vdir/$vname" ;;
+
+    --help|-h)
+      printf "\n${C_BOLD}passx vault${C_RESET} -- manage multiple password stores\n\n"
+      printf "  ${C_BOLD}SUBCOMMANDS${C_RESET}\n"
+      printf "    list                 show all vaults\n"
+      printf "    add  <name>          create vault + initialize store\n"
+      printf "    switch <name>        set active vault (persists)\n"
+      printf "    switch default       return to main store\n"
+      printf "    use <name> -- <cmd>  run ONE command in vault (no side effects)\n"
+      printf "    env [name]           print export statements for current shell\n"
+      printf "    rm <name>            remove vault config (store files untouched)\n"
+      printf "    status               git sync status for all vaults\n"
+      printf "    edit [name]          edit vault config in EDITOR\n"
+      printf "    prompt               print [name] for shell PS1\n"
+      printf "\n  ${C_BOLD}HOW IT WORKS${C_RESET}\n"
+      printf "    Vault config: ~/.config/passx/vaults/NAME\n"
+      printf "    Contains:     export PASSWORD_STORE_DIR=/path/to/store\n"
+      printf "    Sourced at startup; cleanly sets store for that session.\n"
+      printf "\n  ${C_BOLD}EXAMPLES${C_RESET}\n"
+      printf "    passx vault add work\n"
+      printf "    passx vault switch work\n"
+      printf "    passx copy github          # uses work store\n"
+      printf "    passx vault use personal -- copy netflix\n"
+      printf "    passx vault switch default\n"
+      printf "    # Apply in current shell:\n"
+      printf "    eval \$(passx vault env work)\n\n"
+      ;;
+
+    *) err "Usage: passx vault [list|add|switch|use|env|rm|status|edit|prompt]" ;;
+  esac
+}
+
+
+
+# ════════════════════════════════════════════════════════════════
+# § TEAM  — shared vault with multiple GPG recipients
+# ════════════════════════════════════════════════════════════════
+_team_meta_file() {
+  printf "%s/teams/%s" "$PASSX_CONF_DIR" "${1:-default}"
+}
+
+cmd_team() {
+  _cmd="team"
+  local subcmd="${1:-status}"; shift 2>/dev/null || true
+
+  case "$subcmd" in
+    init)
+      local name="${1:-}"
+      [ -z "$name" ] && { printf "  Team vault name: " >&2
+        read -r name </dev/tty; }
+      [ -z "${name:-}" ] && err "No team name"
+      [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] \
+        || err "Name must be alphanumeric / dash / underscore"
+      local vaults_dir; vaults_dir="$(_vault_dir)"
+      [ -f "$vaults_dir/$name" ] \
+        && err "A vault named '$name' already exists"
+      local tdef="$HOME/.password-store-team-${name}"
+      printf "  Store path [%s]: " "$tdef" >&2; read -r tstore </dev/tty
+      tstore="${tstore:-$tdef}"; tstore="${tstore/#\~/$HOME}"
+      printf "  GPG key IDs (space-separated):\n  > " >&2
+      read -r keys </dev/tty
+      [ -z "${keys:-}" ] && err "At least one GPG key required"
+      local kcount; kcount=$(echo $keys | wc -w)
+      mkdir -p "$tstore"
+      # shellcheck disable=SC2086
+      PASSWORD_STORE_DIR="$tstore" pass init $keys \
+        || err "pass init failed -- check your GPG key IDs"
+      [ "$kcount" -lt 2 ] \
+        && warn "Only 1 key -- for a shared vault you usually want multiple keys"
+      printf "  Set up git remote? [Y/n] " >&2; read -r yn </dev/tty || yn="y"
+      if [ "${yn,,}" != "n" ]; then
+        printf "  Git remote SSH URL: " >&2; read -r remote </dev/tty
+        PASSWORD_STORE_DIR="$tstore" pass git init
+        if [ -n "${remote:-}" ]; then
+          PASSWORD_STORE_DIR="$tstore" pass git remote add origin "$remote"
+          ok "Git remote: $remote"
+        fi
+      fi
+      mkdir -p "$PASSX_CONF_DIR/teams"
+      {
+        printf "# Team: %s  created %s by %s@%s\n" \
+          "$name" "$(date '+%Y-%m-%d')" \
+          "$USER" "$(hostname -s 2>/dev/null || echo local)"
+        for k in $keys; do printf "member=%s\n" "$k"; done
+      } > "$(_team_meta_file "$name")"
+      mkdir -p "$vaults_dir"
+      {
+        printf "# passx team vault: %s\n" "$name"
+        printf "export PASSWORD_STORE_DIR=\"%s\"\n" "$tstore"
+      } > "$vaults_dir/$name"
+      ok "Team vault '$name' ready at $tstore"
+      printf "\n  Next:\n"
+      printf "    passx vault switch %s\n" "$name"
+      printf "    passx team add-member <gpg-key-id>   # for each teammate\n\n" ;;
+
+    add-member)
+      local keyid="${1:-}"
+      [ -z "$keyid" ] && { printf "  New member GPG key ID: " >&2
+        read -r keyid </dev/tty; }
+      [ -z "${keyid:-}" ] && err "No key ID"
+      gpg --list-keys "$keyid" >/dev/null 2>&1 \
+        || err "Key not in keyring -- import first: gpg --import pubkey.asc"
+      local existing
+      existing="$(grep -v '^#' "$PASSWORD_STORE_DIR/.gpg-id" 2>/dev/null \
+        | tr '\012' ' ')"
+      case "$existing" in
+        *"$keyid"*) info "Already a member: $keyid"; return 0 ;;
+      esac
+      step "Re-encrypting all entries for new member..."
+      # shellcheck disable=SC2086
+      pass init $existing $keyid || err "Re-encryption failed"
+      local active; active="$(cat "$(_active_file)" 2>/dev/null || true)"
+      [ -n "$active" ] \
+        && printf "member=%s\n" "$keyid" >> "$(_team_meta_file "$active")" \
+        || true
+      ok "Added: $keyid" ;;
+
+    rm-member)
+      local keyid="${1:-}"
+      if [ -z "$keyid" ]; then
+        local metafile
+        metafile="$(_team_meta_file \
+          "$(cat "$(_active_file)" 2>/dev/null || echo default)")"
+        if [ -f "$metafile" ]; then
+          keyid="$(grep '^member=' "$metafile" | cut -d= -f2 \
+            | _fzf_pick "rm-member" "Select member to remove" 30%)" \
+            || return 0
+        else
+          printf "  Member GPG key ID to remove: " >&2
+          read -r keyid </dev/tty
+        fi
+      fi
+      [ -z "${keyid:-}" ] && err "No key ID"
+      local remaining
+      remaining="$(grep -v "^${keyid}$" "$PASSWORD_STORE_DIR/.gpg-id" \
+        2>/dev/null | grep -v '^#' | tr '\012' ' ' | xargs)"
+      [ -z "${remaining:-}" ] && err "Cannot remove the last team member"
+      printf "  Remove %s and re-encrypt all entries? [y/N] " "$keyid" >&2
+      read -r yn </dev/tty || yn=""
+      [ "${yn,,}" != "y" ] && { dim "Aborted"; return 0; }
+      step "Re-encrypting without $keyid..."
+      # shellcheck disable=SC2086
+      pass init $remaining || err "Re-encryption failed"
+      ok "Removed: $keyid" ;;
+
+    members)
+      _banner "Team Members"
+      [ -f "$PASSWORD_STORE_DIR/.gpg-id" ] \
+        || err "Not a team vault (.gpg-id missing)"
+      while IFS= read -r rid; do
+        [ -z "$rid" ] || [[ "$rid" == '#'* ]] && continue
+        local uid
+        uid="$(gpg --list-keys --with-colons "$rid" 2>/dev/null \
+          | awk -F: '/^uid/{print $10; exit}')" \
+          || uid="${C_RED}(not in keyring)${C_RESET}"
+        printf "  ${C_CYAN}%-42s${C_RESET}  %b\n" "$rid" "$uid"
+      done < "$PASSWORD_STORE_DIR/.gpg-id"
+      local cnt
+      cnt="$(grep -vc '^#' "$PASSWORD_STORE_DIR/.gpg-id" 2>/dev/null \
+        || echo 0)"
+      echo ""
+      dim "$cnt recipient(s) -- every entry is encrypted for all of them" ;;
+
+    log)
+      _need_git
+      local path="${1:-}"
+      _banner "Team Activity"
+      if [ -n "$path" ]; then
+        cd "$PASSWORD_STORE_DIR" \
+          && git log --follow \
+               --format="%C(dim)%ai%Creset  %s" -- "${path}.gpg" 2>/dev/null \
+          | sed 's/ +[^ ]*//' | sed 's/^/  /'
+      else
+        cd "$PASSWORD_STORE_DIR" \
+          && git log --oneline --color=always -40 \
+               --format="%C(dim)%ai%Creset  %C(yellow)%h%Creset  %s" 2>/dev/null \
+          | sed 's/ +[^ ]*//' | sed 's/^/  /'
+      fi
+      echo "" ;;
+
+    audit)
+      _banner "Team Audit"
+      local not_rotated=0 total=0
+      while IFS= read -r e; do
+        [ -z "$e" ] && continue
+        [[ "$e" == *-pub || "$e" == *-pvt ]] && continue
+        total=$((total+1))
+        if [ -d "$PASSWORD_STORE_DIR/.git" ]; then
+          local lc days
+          lc="$(cd "$PASSWORD_STORE_DIR" \
+            && git log -1 --format="%ct" -- "${e}.gpg" 2>/dev/null \
+            || echo 0)"
+          days=$(( ($(date +%s) - ${lc:-0}) / 86400 ))
+          [ "$days" -gt "$PASSX_MAX_AGE" ] && {
+            not_rotated=$((not_rotated+1))
+            printf "  ${C_YELLOW}%4dd${C_RESET}  %s\n" "$days" "$e"
+          }
+        fi
+      done < <(list_entries | grep -v '\-pub$\|-pvt$')
+      echo ""
+      printf "  %d entries scanned\n" "$total"
+      [ $not_rotated -eq 0 ] \
+        && ok "All rotated within ${PASSX_MAX_AGE}d" \
+        || warn "$not_rotated entries overdue" ;;
+
+    sync)
+      _need_git
+      step "Pulling..."
+      pass git pull && ok "Pulled" || warn "Pull failed"
+      step "Pushing..."
+      pass git push && ok "Pushed" || warn "Push failed" ;;
+
+    status) cmd_vault status ;;
+
+    --help|-h)
+      printf "\n${C_BOLD}passx team${C_RESET} -- shared vault with multiple GPG recipients\n\n"
+      printf "  init <n>           create team vault\n"
+      printf "  members            list all GPG recipients\n"
+      printf "  add-member <key>   add recipient + re-encrypt entire store\n"
+      printf "  rm-member [key]    remove recipient + re-encrypt entire store\n"
+      printf "  log [path]         git history\n"
+      printf "  audit              rotation status\n"
+      printf "  sync               git pull + push\n"
+      printf "  status             vault sync overview\n\n"
+      printf "  A team vault has multiple keys in .gpg-id.\n"
+      printf "  Every add/edit/rotate re-encrypts for ALL members.\n\n" ;;
+
+    *) err "Usage: passx team [init|members|add-member|rm-member|log|audit|sync|status]" ;;
+  esac
+}
+
+
+
+# ════════════════════════════════════════════════════════════════
+# § OPEN — context-aware smart launch
+# ════════════════════════════════════════════════════════════════
+cmd_open() {
+  _cmd="open"
+  local path="${1:-}"
+  path="$(_resolve_alias "${path:-}")"
+  [ -z "$path" ] && path="$(list_entries_ranked | _fzf_pick "open" "Select entry")" || true
+  [ -z "${path:-}" ] && err "No entry"
+  local e; e="$(pass show "$path" 2>/dev/null)" || err "Cannot decrypt: $path"
+  local url host port db type_field
+  url="$(printf "%s\n"        "$e" | grep -m1 "^url:"      | sed "s/^url: *//")"
+  host="$(printf "%s\n"       "$e" | grep -m1 "^host:"     | sed "s/^host: *//")"
+  port="$(printf "%s\n"       "$e" | grep -m1 "^port:"     | sed "s/^port: *//")"
+  db="$(printf "%s\n"         "$e" | grep -m1 "^database:" | sed "s/^database: *//")"
+  type_field="$(printf "%s\n" "$e" | grep -m1 "^type:"     | sed "s/^type: *//")"
+  # User hook first
+  _hook "open-${type_field:-auto}" "$path" 2>/dev/null && return 0 || true
+  if   [ -n "$url" ];              then xdg-open "$url" >/dev/null 2>&1 & ok "Opening: $url"
+  elif [ -n "$host" ] && [ -n "$db" ]; then cmd_db connect "$path"
+  elif [ -n "$host" ];             then
+    info "Opening SSH: ${host}"
+    local user; user="$(printf "%s\n" "$e" | grep -m1 "^username:" | sed "s/^username: *//") "
+    user="${user%% }"
+    "${PASSX_SSH_TERMINAL:-xterm}" -e "ssh ${user:+${user}@}${host}${port:+ -p $port}" &
+  else
+    warn "Cannot determine how to open this entry"
+    info "Add a url:, host:, or database: field, or define a hook: $PASSX_HOOKS_DIR/open-TYPE.sh"
+  fi
+}
+
+# ════════════════════════════════════════════════════════════════
+# § CONFIG — interactive config editor
+# ════════════════════════════════════════════════════════════════
+cmd_config() {
+  _cmd="config"
+  local conf_file="$PASSX_CONF_DIR/passx.conf"
+  case "${1:-interactive}" in
+    get)
+      [ -z "${2:-}" ] && err "Usage: passx config get <KEY>"
+      [ -f "$conf_file" ] \
+        && grep -m1 "^${2}=" "$conf_file" | cut -d= -f2- | tr -d '"' \
+        || eval "printf \"%s\\n\" \"\${${2}:-}\""
+      return 0 ;;
+    set)
+      [ -z "${2:-}" ] || [ -z "${3:-}" ] && err "Usage: passx config set <KEY> <value>"
+      mkdir -p "$PASSX_CONF_DIR"; touch "$conf_file"
+      if grep -q "^${2}=" "$conf_file" 2>/dev/null; then
+        sed -i "s|^${2}=.*|${2}=\"${3}\"|" "$conf_file"
+      else
+        printf '%s="%s"\n' "$2" "$3" >> "$conf_file"
+      fi
+      ok "Set ${2}=\"${3}\""; return 0 ;;
+    reset)
+      printf "  Delete config and restore defaults? [y/N] " >&2
+      read -r yn </dev/tty || yn=""; [ "${yn,,}" != "y" ] && { dim "Aborted"; return 0; }
+      rm -f "$conf_file"; ok "Config reset to defaults" ;;
+    show)
+      [ -f "$conf_file" ] \
+        && { _banner "Current Config"; cat "$conf_file" | sed 's/^/  /'; echo ""; } \
+        || info "No config file — using all defaults"
+      return 0 ;;
+    interactive|"")
+      command -v fzf >/dev/null 2>&1 || err "fzf required"
+      local -a vars=(
+        "PASSX_AUTOSYNC:Auto-push to git after writes (true/false)"
+        "PASSX_CLIP_TIMEOUT:Clipboard auto-clear timeout (seconds)"
+        "PASSX_MAX_AGE:Password age warning threshold (days)"
+        "PASSX_NOTIFY:Desktop notifications (true/false)"
+        "PASSX_THEME:Color theme (catppuccin/nord/gruvbox/dracula/solarized)"
+        "PASSX_GEN_LENGTH:Default generated password length"
+        "PASSX_GEN_CHARS:Generated password character set"
+        "PASSX_FRECENCY:Frecency-ranked pickers (true/false)"
+        "PASSX_WARN_STALE:Warn when copying stale password (true/false)"
+        "PASSX_AUTOFILL_DELAY:Autofill countdown seconds"
+        "PASSX_PARALLEL_JOBS:Parallel GPG jobs for audit/search"
+        "PASSX_TOMBSTONE:Record deletions (true/false)"
+        "PASSX_DB_CLIENT:Database client (auto/pgcli/psql/mycli/...)"
+        "PASSX_COLOR:Color output (auto/always/never)"
+        "PASSX_DEBUG:Debug logging (0/1)"
+      )
+      local menu_items=""
+      for item in "${vars[@]}"; do
+        local key="${item%%:*}" desc="${item#*:}"
+        local current; current="$(eval "printf \"%s\" \"\${$key:-}\"")"
+        menu_items+="$(printf "%-32s  %-38s  %s\n" "$key" "$desc" "${current:-(default)}")"$'\n'
+      done
+      local chosen; chosen="$(printf "%s" "$menu_items" | _fzf_pick "config" "Select variable to edit" 60%)" || return 0
+      [ -z "${chosen:-}" ] && return 0
+      local chosen_key; chosen_key="$(printf "%s" "$chosen" | awk '{print $1}')"
+      local cur_val; cur_val="$(eval "printf \"%s\" \"\${$chosen_key:-}\"")"
+      printf "  %s" "$chosen_key" >&2
+      [ -n "$cur_val" ] && printf " [current: %s]" "$cur_val" >&2
+      printf " = " >&2; read -r new_val </dev/tty || new_val=""
+      [ -z "${new_val:-}" ] && { dim "Unchanged"; return 0; }
+      cmd_config set "$chosen_key" "$new_val" ;;
+    --help|-h) printf "\n${C_BOLD}passx config${C_RESET} [get|set|reset|show|interactive]\n\n"
+      printf "  ${C_DIM}Examples:${C_RESET}\n"
+      printf "    passx config                          # interactive editor\n"
+      printf "    passx config get PASSX_CLIP_TIMEOUT  # print value\n"
+      printf "    passx config set PASSX_CLIP_TIMEOUT 30\n"
+      printf "    passx config show                     # all current values\n\n" ;;
+    *) err "Usage: passx config [get|set|reset|show|interactive]" ;;
+  esac
+}
+
+# ════════════════════════════════════════════════════════════════
+# § SETUP WIZARD  (passx setup [gpg|store|keys|git|config|comp|check])
+# ════════════════════════════════════════════════════════════════
+_setup_pm() {
+  command -v apt-get >/dev/null 2>&1 && { printf "apt";    return; }
+  command -v pacman  >/dev/null 2>&1 && { printf "pacman"; return; }
+  command -v dnf     >/dev/null 2>&1 && { printf "dnf";    return; }
+  command -v zypper  >/dev/null 2>&1 && { printf "zypper"; return; }
+  command -v brew    >/dev/null 2>&1 && { printf "brew";   return; }
+  printf "unknown"
+}
+
+_setup_pkg_name() {
+  local PM="$1" tool="$2"
+  case "$PM" in
+    apt)    case "$tool" in gpg) echo gnupg;; oathtool) echo oathtool;; zbarimg) echo zbar-tools;;
+              notify-send) echo libnotify-bin;; wl-clipboard) echo wl-clipboard;; *) echo "$tool";; esac ;;
+    pacman) case "$tool" in gpg) echo gnupg;; oathtool) echo oath-toolkit;; zbarimg) echo zbar;;
+              notify-send) echo libnotify;; *) echo "$tool";; esac ;;
+    *) echo "$tool" ;;
+  esac
+}
+
+_setup_install_pkg() {
+  local PM="$1" tool="$2" label="${3:-$2}"
+  local pkg; pkg="$(_setup_pkg_name "$PM" "$tool")"
+  [ -z "$pkg" ] && { dim "  skipping $label (n/a on $PM)"; return 0; }
+  step "Installing $label..."
+  case "$PM" in
+    apt)    sudo apt-get install -y "$pkg" >/dev/null 2>&1 && ok "$label installed" || warn "Failed: $label" ;;
+    pacman) sudo pacman -S --noconfirm "$pkg" >/dev/null 2>&1 && ok "$label installed" || warn "Failed: $label" ;;
+    dnf)    sudo dnf install -y "$pkg" >/dev/null 2>&1 && ok "$label installed" || warn "Failed: $label" ;;
+    zypper) sudo zypper install -y "$pkg" >/dev/null 2>&1 && ok "$label installed" || warn "Failed: $label" ;;
+    brew)   brew install "$pkg" >/dev/null 2>&1 && ok "$label installed" || warn "Failed: $label" ;;
+    *)      warn "Cannot auto-install $label — install it manually" ;;
+  esac
+}
+
+
+_setup_deps() {
+  _banner "Step 1 — Dependencies"
+  local -a required=(pass gpg git curl)
+  local -a optional=(fzf xdotool oathtool qrencode zbarimg wl-clipboard xclip notify-send sshpass jq bat)
+  local missing_req=(); local missing_opt=()
+  for t in "${required[@]}"; do command -v "$t" >/dev/null 2>&1 || missing_req+=("$t"); done
+  for t in "${optional[@]}"; do command -v "$t" >/dev/null 2>&1 || missing_opt+=("$t"); done
+  if [ ${#missing_req[@]} -eq 0 ]; then ok "All required tools present"
+  else
+    warn "Missing required: ${missing_req[*]}"
+    [ "$PM" = "unknown" ] && err "Cannot auto-install — install manually: ${missing_req[*]}"
+    for t in "${missing_req[@]}"; do _setup_install_pkg "$PM" "$t"; done
+    for t in "${required[@]}"; do
+      command -v "$t" >/dev/null 2>&1 || err "$t still missing after install"
+    done
+  fi
+  if [ ${#missing_opt[@]} -gt 0 ]; then
+    printf "\n  ${C_YELLOW}Optional tools not installed:${C_RESET}\n"
+    for t in "${missing_opt[@]}"; do printf "    ${C_DIM}%s${C_RESET}\n" "$t"; done
+    printf "\n  Install optional tools? [y/N] " >&2; read -r yn </dev/tty || yn=""
+    [ "${yn,,}" = "y" ] && for t in "${missing_opt[@]}"; do _setup_install_pkg "$PM" "$t"; done
+  else ok "All optional tools present"; fi
+}
+
+_setup_gpg() {
+  _banner "Step 2 — GPG Key"
+  printf "  ${C_DIM}pass encrypts every entry with your GPG key.${C_RESET}\n\n"
+  local -a fprs=(); local -a uids=()
+  while IFS=: read -r fpr uid; do fprs+=("$fpr"); uids+=("$uid"); done < <(
+    gpg --list-secret-keys --with-colons 2>/dev/null \
+      | awk -F: '/^sec/{f=""}/^fpr/{if(!f)f=$10}/^uid/{if(!u)u=$10}/^ssb/{if(f&&u){print f":"u;f="";u=""}}' 2>/dev/null || true
+  )
+  if [ ${#fprs[@]} -gt 0 ]; then
+    printf "  ${C_GREEN}Existing GPG keys:${C_RESET}\n\n"
+    for i in "${!fprs[@]}"; do
+      printf "    ${C_CYAN}[%d]${C_RESET}  %s  ${C_DIM}(%s)${C_RESET}\n" \
+        $((i+1)) "${uids[$i]}" "${fprs[$i]: -16}"
+    done; printf "\n"
+    printf "  Use existing [number] or [n]ew or [s]kip: " >&2; read -r choice </dev/tty || choice="s"
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#fprs[@]}" ]; then
+      info "Using: ${uids[$((choice-1))]}"
+      printf "%s" "${fprs[$((choice-1))]}" > "$PASSX_CACHE_DIR/setup_gpg_key"
+    elif [ "${choice,,}" = "n" ]; then _setup_create_gpg_key
+    else info "Skipping GPG setup"
+    fi
+  else
+    printf "  No GPG keys found.\n"
+    printf "  Create a new key? [Y/n] " >&2; read -r yn </dev/tty || yn="y"
+    [ "${yn,,}" != "n" ] && _setup_create_gpg_key || info "Skipping"
+  fi
+}
+
+_setup_create_gpg_key() {
+  local name email
+  printf "  Your name: " >&2; read -r name </dev/tty
+  printf "  Your email: " >&2; read -r email </dev/tty
+  [[ "$email" == *@* ]] || err "Invalid email"
+  local _stty; _stty="$(stty -g </dev/tty 2>/dev/null || true)"
+  printf "  Passphrase (Enter for none): " >&2
+  stty -echo </dev/tty 2>/dev/null || true; read -r gpg_pass </dev/tty || gpg_pass=""
+  [ -n "$_stty" ] && stty "$_stty" </dev/tty 2>/dev/null || true; printf "\n" >&2
+  mkdir -p "$HOME/.gnupg"; chmod 700 "$HOME/.gnupg"
+  touch "$HOME/.gnupg/gpg-agent.conf"
+  grep -q "allow-loopback-pinentry" "$HOME/.gnupg/gpg-agent.conf" 2>/dev/null \
+    || printf "allow-loopback-pinentry\n" >> "$HOME/.gnupg/gpg-agent.conf"
+  gpgconf --kill gpg-agent 2>/dev/null || true; sleep 0.4
+  export GPG_TTY; GPG_TTY="$(tty 2>/dev/null)" || GPG_TTY=""
+  local batch; batch="$(mktemp)"; chmod 600 "$batch"
+  if [ -n "$gpg_pass" ]; then
+    printf "Key-Type: EDDSA\nKey-Curve: ed25519\nSubkey-Type: ECDH\nSubkey-Curve: cv25519\nName-Real: %s\nName-Email: %s\nExpire-Date: 2y\nPassphrase: %s\n%%commit\n" \
+      "$name" "$email" "$gpg_pass" > "$batch"
+  else
+    printf "Key-Type: EDDSA\nKey-Curve: ed25519\nSubkey-Type: ECDH\nSubkey-Curve: cv25519\nName-Real: %s\nName-Email: %s\nExpire-Date: 2y\n%%no-protection\n%%commit\n" \
+      "$name" "$email" > "$batch"
+  fi
+  step "Generating Ed25519 key..."
+  gpg --batch --pinentry-mode loopback --gen-key "$batch" 2>/dev/null; rm -f "$batch"
+  local fpr; fpr="$(gpg --list-secret-keys --with-colons "$email" 2>/dev/null \
+    | awk -F: '/^fpr/{print $10;exit}')"
+  [ -n "${fpr:-}" ] || err "Key created but fingerprint not found"
+  ok "Key created: ${fpr: -16}"
+  printf "%s" "$fpr" > "$PASSX_CACHE_DIR/setup_gpg_key"
+  info "Backup: gpg --export-secret-keys --armor $fpr > passx-key-backup.asc"
+}
+
+_setup_store() {
+  _banner "Step 3 — Password Store"
+  local gpg_key; gpg_key="$(cat "$PASSX_CACHE_DIR/setup_gpg_key" 2>/dev/null || true)"
+  if [ -f "$PASSWORD_STORE_DIR/.gpg-id" ]; then
+    info "Store already exists at $PASSWORD_STORE_DIR"
+    [ -n "$gpg_key" ] && {
+      local existing; existing="$(head -1 "$PASSWORD_STORE_DIR/.gpg-id")"
+      [ "$existing" != "$gpg_key" ] && {
+        printf "  Re-init with new key? [y/N] " >&2; read -r yn </dev/tty || yn=""
+        [ "${yn,,}" = "y" ] && pass init "$gpg_key" && ok "Store re-initialized"
+      }
+    }
+  else
+    printf "\n  1) Clone existing git repo  2) Start fresh  3) Skip\n  Choice: " >&2
+    read -r choice </dev/tty || choice="3"
+    case "$choice" in
+      1)
+        printf "  Git SSH URL: " >&2; read -r git_url </dev/tty
+        [ -z "${git_url:-}" ] && { warn "No URL, skipping"; return 0; }
+        [ -d "$PASSWORD_STORE_DIR" ] && rm -rf "$PASSWORD_STORE_DIR"
+        git clone "$git_url" "$PASSWORD_STORE_DIR" && ok "Cloned to $PASSWORD_STORE_DIR" \
+          || err "Clone failed — check SSH key and URL" ;;
+      2)
+        [ -n "$gpg_key" ] && {
+          pass init "$gpg_key" && ok "Store initialized at $PASSWORD_STORE_DIR"
+        } || warn "No GPG key selected — run: pass init <key-id>" ;;
+      *) info "Skipping store setup" ;;
+    esac
+  fi
+  # Git remote setup
+  if [ -d "$PASSWORD_STORE_DIR" ] && [ ! -d "$PASSWORD_STORE_DIR/.git" ]; then
+    printf "\n  Initialize git in store? [y/N] " >&2; read -r yn </dev/tty || yn=""
+    [ "${yn,,}" = "y" ] && pass git init && ok "git initialized"
+  fi
+  if [ -d "$PASSWORD_STORE_DIR/.git" ]; then
+    local remote; remote="$(cd "$PASSWORD_STORE_DIR" && git remote get-url origin 2>/dev/null || true)"
+    [ -z "$remote" ] && {
+      printf "  Add git remote? [y/N] " >&2; read -r yn </dev/tty || yn=""
+      [ "${yn,,}" = "y" ] && {
+        printf "  SSH URL: " >&2; read -r rurl </dev/tty
+        [ -n "${rurl:-}" ] && {
+          pass git remote add origin "$rurl"
+          printf "  Push now? [y/N] " >&2; read -r yn </dev/tty || yn=""
+          [ "${yn,,}" = "y" ] && pass git push -u origin master 2>/dev/null \
+            || pass git push -u origin main 2>/dev/null || warn "Push failed"
+        }
+      }
+    }
+  fi
+}
+
+_setup_git_identity() {
+  _banner "Step 4 — Git Identity"
+  printf "  ${C_DIM}pass commits every change. Git needs a name + email.${C_RESET}\n\n"
+  local gname; gname="$(git config --global user.name  2>/dev/null || true)"
+  local gemail; gemail="$(git config --global user.email 2>/dev/null || true)"
+  if [ -n "$gname" ] && [ -n "$gemail" ]; then
+    ok "Git identity already set: $gname <$gemail>"
+  else
+    [ -z "$gname"  ] && { printf "  Name:  " >&2; read -r gname  </dev/tty; }
+    [ -z "$gemail" ] && { printf "  Email: " >&2; read -r gemail </dev/tty; }
+    [ -n "$gname"  ] && git config --global user.name  "$gname"
+    [ -n "$gemail" ] && git config --global user.email "$gemail"
+    ok "Git identity saved: $gname <$gemail>"
+  fi
+}
+
+_setup_config_step() {
+  _banner "Step 5 — Configuration"
+  local conf="$PASSX_CONF_DIR/passx.conf"
+  if [ -f "$conf" ]; then dim "Config already exists: $conf"
+  else cmd_gen_conf; fi
+}
+
+_setup_completions_step() {
+  _banner "Step 6 — Shell Completions"
+  local shell; shell="$(basename "${SHELL:-bash}")"
+  info "Shell: $shell"
+  case "$shell" in
+    zsh)
+      local zdir="${HOME}/.local/share/zsh/site-functions"; mkdir -p "$zdir"
+      "$0" completions zsh > "$zdir/_passx" 2>/dev/null && ok "zsh completions: $zdir/_passx"
+      local rc="$HOME/.zshrc"
+      grep -q "passx.*site-functions" "$rc" 2>/dev/null || {
+        printf '\n# passx completions\nfpath=($HOME/.local/share/zsh/site-functions $fpath)\nautoload -Uz compinit && compinit\n' >> "$rc"
+        ok "fpath updated in $rc"
+      }
+      grep -q "source <(passx completions zsh)" "$rc" 2>/dev/null && {
+        sed -i '/source <(passx completions zsh)/d' "$rc"
+        dim "Removed old broken source <() line"
+      } ;;
+    bash)
+      local bdir="${HOME}/.local/share/bash-completion/completions"; mkdir -p "$bdir"
+      "$0" completions bash > "$bdir/passx" 2>/dev/null && ok "bash completions: $bdir/passx" ;;
+    fish)
+      local fdir="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions"; mkdir -p "$fdir"
+      "$0" completions fish > "$fdir/passx.fish" 2>/dev/null && ok "fish completions: $fdir/passx.fish" ;;
+    *) warn "Unknown shell '$shell' — run: passx completions bash|zsh|fish" ;;
+  esac
+}
+
+_setup_check() {
+  _banner "Setup Check"
+  "$0" doctor
+}
+
+cmd_setup() {
+  _cmd="setup"
+  local subcmd="${1:-all}"; shift 2>/dev/null || true
+  local PM; PM="$(_setup_pm)"
+  info "Package manager: ${PM}"
+
+  case "$subcmd" in
+    all)
+      _setup_deps
+      _setup_gpg
+      _setup_store
+      _setup_git_identity
+      _setup_config_step
+      _setup_completions_step
+      _banner "Setup Complete"
+      printf "  ${C_BOLD}Quick start:${C_RESET}\n\n"
+      printf "    ${C_CYAN}passx doctor${C_RESET}                      # verify everything\n"
+      printf "    ${C_CYAN}passx add github user@mail.com${C_RESET}    # first entry\n"
+      printf "    ${C_CYAN}passx show${C_RESET}                         # interactive picker\n"
+      printf "    ${C_CYAN}passx --help${C_RESET}                       # all commands\n\n"
+      info "Restart your shell to activate completions." ;;
+    deps)         _setup_deps ;;
+    gpg)          _setup_gpg ;;
+    store)        _setup_store ;;
+    git)          _setup_git_identity ;;
+    config)       _setup_config_step ;;
+    comp|completions) _setup_completions_step ;;
+    check)        _setup_check ;;
+    --help|-h)
+      printf "\n${C_BOLD}passx setup${C_RESET} [all|deps|gpg|store|git|config|comp|check]\n\n"
+      printf "  Full interactive setup wizard. Each step is idempotent — safe to re-run.\n\n"
+      printf "  ${C_DIM}Subcommands:${C_RESET}\n"
+      printf "    all    — full wizard (default)\n    deps   — install dependencies\n"
+      printf "    gpg    — GPG key setup\n    store  — password store + git remote\n"
+      printf "    git    — git identity (name + email)\n    config — generate passx.conf\n"
+      printf "    comp   — shell completions\n    check  — run doctor\n\n" ;;
+    *) err "Usage: passx setup [all|deps|gpg|store|git|config|comp|check]" ;;
+  esac
+}
+
+
+# ════════════════════════════════════════════════════════════════
+# § EXPORT-AGE
+# ════════════════════════════════════════════════════════════════
+cmd_export_age() {
+  _cmd="export-age"
+  local out="${1:-}"; [ -z "$out" ] && err "Usage: passx export-age <file.tar.age>"
+  command -v age >/dev/null 2>&1 || err "age not installed — see: https://age-encryption.org"
+  _banner "Export with age encryption"
+  local tmp; tmp="$(mktemp -d)"
+  step "Archiving..."
+  tar -C "$(dirname "$PASSWORD_STORE_DIR")" -czf "$tmp/store.tar.gz" \
+    "$(basename "$PASSWORD_STORE_DIR")" || { rm -rf "$tmp"; err "tar failed"; }
+  step "Encrypting with age passphrase..."
+  age -p -o "$out" "$tmp/store.tar.gz" || { rm -rf "$tmp"; err "age encryption failed"; }
+  rm -rf "$tmp"
+  [ -s "$out" ] || err "Output file is empty"
+  ok "age-encrypted export → $out"
+  dim "Restore: age -d $out | tar -xz -C ~"
+}
+
+# ════════════════════════════════════════════════════════════════
+# § IMPORT MERGE MODE (wrapper — adds --merge to existing import cmds)
+# ════════════════════════════════════════════════════════════════
+# (Handled inside _import_one via the merge=true flag passed from import commands)
+
+# ════════════════════════════════════════════════════════════════
+# § CRON-CHECK (uses shared _score_password helper)
+# ════════════════════════════════════════════════════════════════
+# (cmd_cron_check already exists and uses _score_password)
+
+# ════════════════════════════════════════════════════════════════
 # § ENTRY POINT
 # ════════════════════════════════════════════════════════════════
+_passx_init "${1:-}"
+
 if [ "${1:-}" = "" ]; then
   command -v pass >/dev/null 2>&1 && { pass ls; exit $?; }
   _help overview; exit 0
@@ -3439,8 +5322,11 @@ case "${1:-}" in
   rm|delete)      shift; cmd_rm "$@" ;;
   rotate)         shift; cmd_rotate "$@" ;;
   search)         shift; cmd_search "$@" ;;
+  find)           shift; cmd_find "$@" ;;
+  where)          shift; cmd_where "$@" ;;
   gen)            shift; cmd_gen "$@" ;;
   ls)             pass ls ;;
+  history)        shift; cmd_history "$@" ;;
   # ── OTP ───────────────────────────────────────────────────
   otp)            shift; cmd_otp "$@" ;;
   otp-show)       shift; cmd_otp_show "$@" ;;
@@ -3453,14 +5339,23 @@ case "${1:-}" in
   # ── Automation ────────────────────────────────────────────
   fill)           shift; cmd_fill "$@" ;;
   login)          shift; cmd_login "$@" ;;
-  url|open)       shift; cmd_url "$@" ;;
+  url)            shift; cmd_url "$@" ;;
+  open)           shift; cmd_open "$@" ;;
   run)            shift; cmd_run "$@" ;;
+  snip)           shift; cmd_snip "$@" ;;
+  # ── Database ──────────────────────────────────────────────
+  db)             shift; cmd_db "$@" ;;
   # ── Secrets ───────────────────────────────────────────────
   note)           shift; cmd_note "$@" ;;
   card)           shift; cmd_card "$@" ;;
   env)            shift; cmd_env "$@" ;;
   dotenv)         shift; cmd_dotenv "$@" ;;
   template|T|t)   shift; cmd_template "$@" ;;
+<<<<<<< HEAD:passx-1.0.sh
+=======
+  template-new)   cmd_template_new ;;
+  attach)         shift; cmd_attach "$@" ;;
+>>>>>>> dev:passx
   # ── Security ──────────────────────────────────────────────
   strength)       shift; cmd_strength "$@" ;;
   entropy)        shift; cmd_entropy "$@" ;;
@@ -3471,6 +5366,9 @@ case "${1:-}" in
   share)          shift; cmd_share "$@" ;;
   recipients)     cmd_recipients ;;
   reencrypt)      cmd_reencrypt ;;
+  # ── Vault ─────────────────────────────────────────────────
+  vault)          shift; cmd_vault "$@" ;;
+  team)           shift; cmd_team "$@" ;;
   # ── SSH ───────────────────────────────────────────────────
   ssh)            cmd_ssh ;;
   ssh-add)        shift; cmd_ssh_add "$@" ;;
@@ -3485,7 +5383,6 @@ case "${1:-}" in
   gpg-set)        shift; cmd_gpg_set "$@" ;;
   gpg-rm)         shift; cmd_gpg_rm "$@" ;;
   gpg-list)       cmd_gpg_list ;;
-
   # ── Import / Export ───────────────────────────────────────
   import-csv)         shift; cmd_import_csv "$@" ;;
   import-bitwarden)   shift; cmd_import_bitwarden "$@" ;;
@@ -3494,6 +5391,7 @@ case "${1:-}" in
   import-keepass)     shift; cmd_import_keepass "$@" ;;
   export-bitwarden)   shift; cmd_export_bitwarden "$@" ;;
   export-encrypted)   shift; cmd_export_encrypted "$@" ;;
+  export-age)         shift; cmd_export_age "$@" ;;
   # ── Maintenance ───────────────────────────────────────────
   gc)             shift; cmd_gc "${1:-}" ;;
   lint)           cmd_lint ;;
@@ -3502,6 +5400,17 @@ case "${1:-}" in
   watch)          shift; cmd_watch "$@" ;;
   gen-conf)       cmd_gen_conf ;;
   git)            shift; cmd_git "$@" ;;
+  meta-build)     cmd_meta_build ;;
+  # ── Config ────────────────────────────────────────────────
+  config)         shift; cmd_config "$@" ;;
+  setup)          shift; cmd_setup "$@" ;;
+  # ── Alias / Pin / Frecency ────────────────────────────────
+  alias)          shift; cmd_alias "$@" ;;
+  pin)            shift; cmd_pin "$@" ;;
+  frecency)       shift; cmd_frecency "$@" ;;
+  # ── Tombstone / Clip history ──────────────────────────────
+  tombstone)      shift; cmd_tombstone "$@" ;;
+  clip-history)   shift; cmd_clip_history "$@" ;;
   # ── Tools ─────────────────────────────────────────────────
   sync)           shift; cmd_sync "$@" ;;
   log)            shift; cmd_log "$@" ;;

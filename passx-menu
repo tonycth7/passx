@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# passx-menu — dmenu / rofi launcher for passx
+# Bind to a key in your WM config, e.g.:
+#   sxhkd:   super + p   =>   passx-menu
+#   i3/sway: bindsym $mod+p exec passx-menu
+#   dwm:     use passx-dmenu in config.h
+
+set -euo pipefail
+
+PASSWORD_STORE_DIR="${PASSWORD_STORE_DIR:-$HOME/.password-store}"
+
+# ── Menu backend ──────────────────────────────────────────────────
+# Override with: MENU=rofi passx-menu
+#                MENU="wofi --show dmenu" passx-menu
+MENU="${MENU:-dmenu}"
+
+if [ "$MENU" = "rofi" ]; then
+    _menu() { rofi -dmenu -i -p "$1"; }
+elif [ "$MENU" = "wofi" ]; then
+    _menu() { wofi --show dmenu --prompt "$1"; }
+elif [ "$MENU" = "bemenu" ]; then
+    _menu() { bemenu -p "$1"; }
+elif [ "$MENU" = "fuzzel" ]; then
+    _menu() { fuzzel --dmenu --prompt "$1: "; }
+else
+    _menu() { dmenu -i -p "$1"; }
+fi
+
+# ── Notify helper (no-op if libnotify missing) ────────────────────
+_notify() {
+    command -v notify-send >/dev/null 2>&1 \
+        && notify-send -a passx -t 3000 -i dialog-password "$1" "${2:-}" 2>/dev/null || true
+}
+
+# ── Pick entry ────────────────────────────────────────────────────
+entries=$(find "$PASSWORD_STORE_DIR" -type f -name "*.gpg" 2>/dev/null \
+    | sed "s|$PASSWORD_STORE_DIR/||; s|\.gpg$||" \
+    | sort)
+
+[ -z "$entries" ] && { _notify "passx" "No entries found in $PASSWORD_STORE_DIR"; exit 1; }
+
+entry=$(printf "%s\n" "$entries" | _menu "🔐 pass")
+[ -z "$entry" ] && exit 0
+
+# ── Pick action ───────────────────────────────────────────────────
+actions=$(printf "%s\n" \
+    "󰌆  copy password" \
+    "  copy username" \
+    "  copy email" \
+    "  copy OTP" \
+    "  autofill (xdotool/ydotool)" \
+    "  open URL" \
+    "  show entry" \
+    "  view in terminal")
+
+action=$(printf "%s\n" "$actions" | _menu "$entry")
+[ -z "$action" ] && exit 0
+
+# Strip icon prefix for matching
+action_clean="${action#*  }"
+
+case "$action_clean" in
+    "copy password")
+        if passx copy "$entry" -p 2>/dev/null; then
+            _notify "passx" "Password copied: ${entry##*/}"
+        fi
+        ;;
+    "copy username")
+        if passx copy "$entry" -u 2>/dev/null; then
+            _notify "passx" "Username copied: ${entry##*/}"
+        fi
+        ;;
+    "copy email")
+        if passx copy "$entry" -e 2>/dev/null; then
+            _notify "passx" "Email copied: ${entry##*/}"
+        fi
+        ;;
+    "copy OTP")
+        if passx otp "$entry" 2>/dev/null; then
+            _notify "passx" "OTP copied: ${entry##*/}"
+        fi
+        ;;
+    "autofill (xdotool/ydotool)")
+        passx fill "$entry" &
+        ;;
+    "open URL")
+        passx url "$entry" 2>/dev/null &
+        ;;
+    "show entry")
+        # Show in a new terminal
+        terminal="${TERMINAL:-xterm}"
+        if   command -v foot      >/dev/null 2>&1; then foot -e bash -c "passx show '$entry' -f; read -rp '(enter to close)'" &
+        elif command -v alacritty >/dev/null 2>&1; then alacritty -e bash -c "passx show '$entry' -f; read -rp '(enter to close)'" &
+        elif command -v kitty     >/dev/null 2>&1; then kitty -- bash -c "passx show '$entry' -f; read -rp '(enter to close)'" &
+        elif command -v xterm     >/dev/null 2>&1; then xterm -e bash -c "passx show '$entry' -f; read -rp '(enter to close)'" &
+        else _notify "passx" "No terminal found — install foot/alacritty/kitty/xterm"; fi
+        ;;
+    "view in terminal")
+        terminal="${TERMINAL:-xterm}"
+        if   command -v foot      >/dev/null 2>&1; then foot -e bash -c "passx show '$entry'; read -rp '(enter to close)'" &
+        elif command -v alacritty >/dev/null 2>&1; then alacritty -e bash -c "passx show '$entry'; read -rp '(enter to close)'" &
+        elif command -v kitty     >/dev/null 2>&1; then kitty -- bash -c "passx show '$entry'; read -rp '(enter to close)'" &
+        elif command -v xterm     >/dev/null 2>&1; then xterm -e bash -c "passx show '$entry'; read -rp '(enter to close)'" &
+        else _notify "passx" "No terminal found"; fi
+        ;;
+esac

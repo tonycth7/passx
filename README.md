@@ -1,287 +1,319 @@
 # passx
 
-> a power-user wrapper around `pass` — fast, structured, opinionated.
+**A fast, power-user interface for [pass](https://www.passwordstore.org/).**
+
+passx wraps `pass` with an interactive fzf TUI, frecency-ranked pickers, OTP helpers, Wayland/X11 autofill, a database mode, multi-vault support, team vaults, SSH/GPG key storage, import/export from all major password managers, and a full setup wizard.
 
 ---
 
-passx is not a new password manager. it sits on top of [`pass`](https://www.passwordstore.org/) — the unix password store — and turns it into something you'd actually want to use every day. the underlying model stays the same: GPG-encrypted files, plain filesystem, git-native. passx adds structure, speed, and a full feature layer without touching what makes pass good.
+## Install
 
----
-
-## install
-
-one line:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/tonycth7/passx/main/install.sh | bash
+### Arch Linux (AUR)
+```bash
+yay -S passx          # or: paru -S passx
 ```
 
-the installer handles everything — dependencies, GPG key setup, SSH key, git remote, shell completions. it detects your package manager (apt, pacman, dnf, brew) and asks before touching anything.
+### One-liner (any distro)
+```bash
+# System-wide install (/usr/local/bin) — asks for sudo when needed
+bash <(curl -fsSL https://raw.githubusercontent.com/tonycth7/passx/main/install.sh)
 
----
+# User install (~/.local/bin) — no sudo required
+curl -fsSL https://raw.githubusercontent.com/tonycth7/passx/main/install.sh | PREFIX=$HOME/.local bash
+```
 
-or clone and run manually:
-
-```sh
+### From cloned repo or extracted tarball
+```bash
 git clone https://github.com/tonycth7/passx
 cd passx
-chmod +x install.sh
-bash install.sh
+bash install.sh                    # system-wide, asks sudo when needed
+PREFIX=$HOME/.local bash install.sh  # user install, no sudo
+```
+
+> **Note:** always run with `bash install.sh`, not `./install.sh`.  
+> `./install.sh` requires the execute bit (`chmod +x`) and  
+> `sudo ./install.sh` fails because sudo uses a restricted PATH.  
+> `bash install.sh` / `sudo bash install.sh` always works.
+
+---
+
+## Quick start
+
+If you're new to `pass`:
+```bash
+passx setup           # interactive wizard: deps, GPG key, store, completions
+passx doctor          # verify everything works
+```
+
+If you already use `pass`:
+```bash
+passx doctor          # check what's available
+passx show            # open the interactive picker
 ```
 
 ---
 
-## philosophy
+## Dependencies
 
-- **don't replace, extend** — pass is the source of truth. passx is the interface.
-- **speed first** — clipboard, fzf, fuzzy everything. common actions are one keypress.
-- **structured by default** — every entry has username, email, url, otp fields. no freeform chaos.
-- **your password, your choice** — generate strong passwords or bring your own. both first-class.
-- **security without theater** — k-anonymity HIBP checks, clipboard auto-clear, private-key guards, strength audits.
-- **degrade gracefully** — optional tools are optional. works headless, works on Wayland and X11 and WSL, works without fzf.
+**Required:** `pass`, `gnupg`, `git`, `bash`
+
+**Strongly recommended:** `fzf` (interactive pickers)
+
+**Optional:**
+
+| Tool | Feature |
+|------|---------|
+| `xdotool` | Autofill on X11 |
+| `ydotool` | Autofill on Wayland |
+| `oathtool` | TOTP without pass-otp extension |
+| `qrencode` | QR code generation |
+| `zbar` | QR code scanning |
+| `xclip` | X11 clipboard |
+| `wl-clipboard` | Wayland clipboard |
+| `libnotify` | Desktop notifications |
+| `sshpass` | SSH credential injection |
+| `jq` | Bitwarden import/export |
+| `age` | Modern encryption export |
+| `python3` | Shannon entropy calculation |
+| `pgcli` / `psql` | PostgreSQL |
+| `mycli` / `mysql` | MySQL |
 
 ---
 
-## usage
+## Core usage
 
-```sh
-# add entries
-passx add github tony@mail.com              # generated password
-passx add github --password                 # prompt for your own (hidden input + confirm)
-passx add github -a                         # same as --password
-passx add github --password myPass123       # supply directly
+```bash
+# Interactive picker (frecency-ranked, shows most-used entries first)
+passx show
+passx copy github          # copy password
+passx copy github -u       # copy username
+passx show github:email    # print email field
+passx copy aws:token       # copy token field
 
-# access
-passx show github                           # fzf action menu
-passx copy github                           # copy password  (auto-clears in 20s)
-passx copy github -u                        # copy username
-passx show github:email                     # print email field directly
+# Add entries
+passx add work/github user@company.com tony 32
+passx template             # pick a template type interactively
+passx template database    # skip picker, go straight to database template
 
-# otp  (picker shows only entries that have OTP configured)
-passx otp                                   # pick from OTP entries → copy live code
-passx otp github                            # copy code for specific entry
-passx otp-show                              # live countdown display — filtered picker
-passx otp-fill                              # type code into focused window — filtered picker
+# Search
+passx search               # fzf over all entries
+passx where github.com     # find entries by URL domain
+passx find "tony"          # full-text search (decrypts every entry)
+```
 
-# autofill
-passx fill github                           # type user → TAB → pass → Enter
-passx login github                          # copy user, then copy pass
-passx run servers/vps ssh root@1.2.3.4      # inject creds as env vars
+---
 
-# generate
-passx gen                                   # random 32-char password → clipboard
-passx gen --words 5                         # 5-word passphrase
-passx gen --pin 6                           # numeric PIN
-passx gen --pronounceable                   # speakable password
+## OTP
 
-# manage
-passx edit github                           # open in $EDITOR (nvim/vim/vi/nano)
-passx rotate github                         # generate new password
-passx set-field github url https://github.com
-passx rename github work/github
-passx clone github github-personal
-passx rm github                             # delete entry  (alias: delete)
-passx ls                                    # list all entries (pass ls)
+```bash
+passx otp github           # print + copy TOTP
+passx otp -n github        # print only, don't copy
+passx otp-show github      # live countdown display
+passx otp-import github    # import from QR image or manual entry
+passx otp-qr github        # show QR in terminal
+```
 
-# security
-passx audit                                 # weak / duplicate / aged passwords
-passx audit --fix                           # auto-rotate weak entries
-passx hibp --all                            # check every entry against breach database
-passx strength github                       # 4-point strength rating
-passx entropy github                        # Shannon entropy in bits
+---
 
-# templates  (-a prompts for your own password instead of generating)
-passx template                              # interactive: web-login, server, db, api-key, card, wifi...
-passx t                                     # shortcut
-passx t -a                                  # own password mode — hidden input + confirm
-passx template -n                           # don't print password on screen after creation
+## Autofill
 
-# secrets  (pickers show only relevant entries)
-passx note                                  # pick from entries that have a note: field
-passx note add                              # create a new note
-passx card                                  # pick from entries that have a number: field
-passx env                                   # pick from entries that have token:/api-key:/secret: fields
+```bash
+passx fill github          # 3s countdown, then type user TAB password
+passx fill -e github       # press Enter after password
+passx fill --delay 5 github
+passx fill --no-delay github
+```
 
-# ssh  (shows only ssh/ entries, then action menu)
-passx ssh                                   # smart picker → restore / copy pub key / ssh-copy-id / remove
-passx ssh-add                               # store a keypair
-passx ssh-list                              # list stored keys
-passx ssh-set <key>                         # restore key to ~/.ssh + agent
-passx ssh-copy-id <key> user@host           # install public key on remote
+Works on X11 (xdotool) and Wayland (ydotool). Shows target window name during countdown.
 
-# gpg  (shows only gpg/ entries, then action menu)
-passx gpg                                   # smart picker → restore / remove / show fingerprint
-passx gpg-add                               # store a keypair
-passx gpg-list                              # list stored keys
-passx gpg-set                               # restore key to keyring
+---
 
-# import
+## Database mode
+
+```bash
+passx template database    # create a database entry
+passx db list              # list all database entries (auto-detects type)
+passx db connect prod/pg   # open interactive shell (pgcli or psql)
+passx db query prod/pg "SELECT version()"
+passx db tunnel prod/pg    # SSH tunnel to remote DB
+```
+
+Supports: PostgreSQL, MySQL/MariaDB, Redis, MongoDB, SQLite.
+Client preference: pgcli > psql, mycli > mysql.
+
+---
+
+## Multiple vaults
+
+```bash
+# Create vaults
+passx vault add work
+passx vault add personal
+
+# Switch active vault (persists across sessions)
+passx vault switch work
+passx copy github            # uses work store
+
+# One-off (no side effects)
+passx vault use personal -- copy netflix
+
+# Apply vault in current shell session
+eval $(passx vault env work)
+
+# Check sync status
+passx vault status
+```
+
+Each vault is a config file at `~/.config/passx/vaults/NAME` containing:
+```bash
+export PASSWORD_STORE_DIR="/path/to/store"
+```
+
+---
+
+## Team vaults
+
+```bash
+# Create a shared store with multiple GPG keys
+passx team init myteam
+
+# Activate it
+passx vault switch myteam
+
+# Add teammates (re-encrypts entire store for new key)
+passx team add-member ABCD1234EF567890
+
+# List members
+passx team members
+
+# View activity log
+passx team log
+
+# Audit rotation status
+passx team audit
+```
+
+A team vault is a normal `pass` store with multiple keys in `.gpg-id`. Every entry is encrypted for all members simultaneously.
+
+---
+
+## Security tools
+
+```bash
+passx audit               # scan for weak, duplicate, aged passwords
+passx audit --fix         # auto-rotate weak entries
+passx audit --fix-interactive  # review each one interactively
+passx hibp github         # check against HaveIBeenPwned (k-anonymity)
+passx hibp --all          # check entire store
+passx strength github     # 4-point strength rating
+passx entropy github      # Shannon entropy in bits
+passx age                 # password age report from git history
+```
+
+---
+
+## SSH / GPG key storage
+
+```bash
+passx ssh-add             # store SSH keypair in pass
+passx ssh-set             # restore key to ~/.ssh/ + ssh-agent
+passx ssh                 # fzf picker for stored keys
+passx ssh-list
+
+passx gpg-add             # store GPG keypair
+passx gpg-set             # restore to keyring
+```
+
+---
+
+## Import / Export
+
+```bash
 passx import-bitwarden export.json
+passx import-csv passwords.csv
 passx import-firefox logins.csv
 passx import-chrome passwords.csv
-passx import-keepass keepass.xml
+passx import-keepass export.xml
 
-# sync
-passx sync                                  # git pull + push
-passx log                                   # git history
-passx diff github                           # diff entry between commits
-
-# tools
-passx doctor                                # dependency and env check
-passx stats                                 # store statistics
-passx backup                                # encrypted archive export
-```
-
-every command has `--help`:
-
-```sh
-passx add --help
-passx gen --help
-passx template --help
+passx export-bitwarden out.json      # plaintext — keep secure!
+passx export-encrypted backup.gpg    # symmetric GPG
+passx export-age backup.tar.age      # age encryption
 ```
 
 ---
 
-## passx-menu
+## Performance
 
-a rofi / wofi / dmenu launcher that gives you full passx access without a terminal.
+```bash
+# Build metadata cache for instant URL/DB lookups
+passx meta-build
 
-```sh
-passx-menu              # main picker — entries + quick actions
-passx-menu otp          # OTP picker — filtered to OTP entries only, live codes
-passx-menu t            # new entry from template
-passx-menu fill         # autofill service picker
-passx-menu copy         # pick entry → copy password
-passx-menu ssh          # SSH key manager — filtered to ssh/ entries
-passx-menu gen          # generate password → clipboard
-passx-menu add          # add entry (generate / own password / full terminal)
-passx-menu conf         # interactive settings editor
+# After that these are near-instant:
+passx where github.com
+passx db list
 ```
 
-**all pickers are smart** — otp shows only OTP entries, ssh shows only SSH keys. no scrolling through unrelated entries.
+The entry list is cached after first use and invalidated on every write.
 
-**own password in the launcher** — when adding or using a template, choosing "my own password" prompts with a hidden input field (rofi/wofi show `●●●●`, dmenu shows a `[visible]` warning). no terminal opens unless you explicitly choose "open terminal".
+---
 
-**action menu** (per entry) — built dynamically based on what fields exist:
+## Configuration
 
-- copy password / username / email / token / url
-- OTP → copy / type / show with countdown
-- autofill (user + TAB + pass + Enter) or type password only
-- open url in browser
-- **change password** → rotate (generate new) or set your own (hidden prompt, no terminal)
-- set field — pick from list or type custom field name; password field uses hidden input
-- edit in $EDITOR
-- rename / clone / delete
-- show full entry, check strength, check HIBP
-
-**main menu header:**
-```
-  new entry from template
-  autofill service
-  otp picker
-  ssh keys
-  gpg keys
-  generate password
-  add entry
-  audit
-  doctor
-  settings
+```bash
+passx config              # interactive fzf editor
+passx config set PASSX_CLIP_TIMEOUT 30
+passx config get PASSX_THEME
+passx gen-conf            # generate ~/.config/passx/passx.conf
 ```
 
-**themes** — catppuccin (default), nord, gruvbox, dracula, solarized — set in `~/.config/passx/menu.conf` or via `passx-menu conf`.
+Key settings:
 
-**bind to a key** in your WM — example for dwm/sway/i3:
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PASSX_CLIP_TIMEOUT` | 20 | Clipboard auto-clear (seconds) |
+| `PASSX_MAX_AGE` | 180 | Age warning threshold (days) |
+| `PASSX_AUTOSYNC` | false | Auto git push after writes |
+| `PASSX_THEME` | catppuccin | fzf colour theme |
+| `PASSX_GEN_LENGTH` | 32 | Default password length |
+| `PASSX_FRECENCY` | true | Frecency-ranked pickers |
+| `PASSX_WARN_STALE` | true | Warn when copying old passwords |
+| `PASSX_AUTOFILL_DELAY` | 3 | Autofill countdown (seconds) |
+| `PASSX_DB_CLIENT` | auto | Database client preference |
 
-```sh
-# sway / i3
-bindsym $mod+p exec passx-menu
-bindsym $mod+shift+p exec passx-menu otp
+---
+
+## Shell completions
+
+Installed automatically by the PKGBUILD or `install.sh`.
+
+To activate in the current session:
+```bash
+# bash
+source /usr/share/bash-completion/completions/passx
+
+# zsh
+source /usr/share/zsh/site-functions/_passx
+
+# fish
+passx completions fish | source
+```
+
+Tab-complete works for all commands, subcommands, and entry paths.
+
+---
+
+## Full command reference
+
+```
+passx --help
+passx <command> --help
+man passx
 ```
 
 ---
 
-## entry format
+## Philosophy
 
-```
-mypassword
-username: tony
-email: tony@mail.com
-url: https://github.com
-notes: personal account
-otp: otpauth://totp/GitHub:tony?secret=JBSWY3DPEHPK3PXP
-token: ghp_xxxxxxxxxxxx
-```
-
-first line is always the password. everything else is `key: value`. any field name works — passx reads and writes them all. add or update any field with `passx set-field`.
-
----
-
-## configuration
-
-```sh
-passx gen-conf          # generate ~/.config/passx/passx.conf
-passx-menu conf         # interactive settings for passx-menu
-```
-
-key options in `~/.config/passx/passx.conf`:
-
-```sh
-PASSX_AUTOSYNC="false"       # git push/pull on every change
-PASSX_CLIP_TIMEOUT="20"      # seconds before clipboard clears
-PASSX_MAX_AGE="180"          # days before audit flags entry as aged
-PASSX_THEME="catppuccin"     # catppuccin | nord | gruvbox | dracula | solarized
-PASSX_GEN_LENGTH="32"        # default password length
-PASSX_GEN_CHARS="A-Za-z0-9@#%+=_"
-```
-
-all options can also be set as environment variables.
-
----
-
-## hooks
-
-drop executable scripts in `~/.config/passx/hooks/` to run on events:
-
-```
-post-add.sh
-post-edit.sh
-post-rotate.sh
-post-sync.sh
-```
-
----
-
-## dependencies
-
-**required** — `pass`, `gpg`, `git`, `bash ≥ 4`
-
-**optional** — passx degrades gracefully without any of these:
-
-| tool | used for |
-|---|---|
-| `fzf` | fuzzy picker, search, interactive ui |
-| `rofi` / `wofi` / `dmenu` | passx-menu launcher |
-| `xdotool` | autofill, login, otp-fill |
-| `wl-copy` / `xclip` / `xsel` | clipboard |
-| `oathtool` | TOTP codes |
-| `qrencode` | QR code generation |
-| `zbarimg` | QR code scanning |
-| `curl` | HIBP breach check |
-| `notify-send` | desktop notifications |
-| `sshpass` | SSH credential injection via `passx run` |
-| `jq` | JSON export |
-| `bat` | syntax-highlighted fzf previews |
-
----
-
-## status
-
-**v1.1.0** — feature-complete bash implementation. production ready for daily use.
-
-a **Rust rewrite** is planned — same interface, same philosophy, native binary, proper error handling, package-ready for AUR and Homebrew. the bash version stays maintained until then.
-
----
-
-## license
-
-MIT
+passx is designed like `fzf`, `ripgrep`, and `bat`: small, fast, composable.
+It adds a better interface to `pass` without reimplementing encryption.
+Your `~/.password-store` stays standard — drop passx any time and `pass` still works.
