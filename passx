@@ -1814,11 +1814,7 @@ cmd_login() {
 
 cmd_fill() {
   _cmd="fill"
-<<<<<<< HEAD:passx-1.0.sh
-  local enter_after=false delay_secs=3 pass_only=false user_only=false
-=======
   local enter_after=false delay_secs="${PASSX_AUTOFILL_DELAY:-3}" pass_only=false user_only=false
->>>>>>> dev:passx
   while [ "$#" -gt 0 ]; do
     case "$1" in
       -e)           enter_after=true ;;
@@ -1828,15 +1824,6 @@ cmd_fill() {
       --no-delay)   delay_secs=0 ;;
       -*) err "Usage: passx fill [-e] [-p|--pass] [-u|--user] [--delay N] [--no-delay] <path>" ;;
       *)  break ;;
-<<<<<<< HEAD:passx-1.0.sh
-    esac
-    shift
-  done
-  local path="${1:-}"
-  [ -z "$path" ] && path="$(list_entries | _fzf_pick "fill" "Select entry to autofill")" || true
-  [ -z "${path:-}" ] && err "Usage: passx fill [-e] <path>"
-  command -v xdotool >/dev/null 2>&1 || err "xdotool required"
-=======
     esac; shift
   done
   local path="${1:-}"; path="$(_resolve_alias "${path:-}")"
@@ -1855,42 +1842,11 @@ cmd_fill() {
       || err "xdotool required for X11 autofill"
   fi
 
->>>>>>> dev:passx
   local user passw
   user="$(extract_field "$path" username || true)"
   passw="$(extract_field "$path" password || true)"
   [ -z "${user:-}" ] && [ -z "${passw:-}" ] && err "No credentials in $path"
 
-<<<<<<< HEAD:passx-1.0.sh
-  # Countdown so user can focus the target window
-  if [ "$delay_secs" -gt 0 ]; then
-    for ((i=delay_secs; i>0; i--)); do
-      printf "  ${C_CYAN}⌨  Autofilling ${C_BOLD}%s${C_RESET}${C_CYAN} in %ds ...${C_RESET}  \r" "${path##*/}" "$i" >&2
-      sleep 1
-    done
-    printf "%-60s\r" "" >&2  # clear line
-  fi
-
-  if $user_only; then
-    [ -z "${user:-}" ] && err "No username in $path"
-    xdotool type --delay 25 --clearmodifiers "$user"
-    ok "Typed username for ${path##*/}"
-    return 0
-  fi
-  if $pass_only; then
-    [ -z "${passw:-}" ] && err "No password in $path"
-    xdotool type --delay 20 --clearmodifiers "$passw"
-    $enter_after && xdotool key --clearmodifiers Return
-    ok "Typed password for ${path##*/}"
-    return 0
-  fi
-
-  [ -n "${user:-}" ]  && { xdotool type --delay 25 --clearmodifiers "$user"; sleep 0.08; }
-  xdotool key --clearmodifiers Tab; sleep 0.08
-  [ -n "${passw:-}" ] && { xdotool type --delay 20 --clearmodifiers "$passw"; sleep 0.08; }
-  $enter_after && xdotool key --clearmodifiers Return
-  ok "Autofilled ${path##*/}"
-=======
   # Countdown + show target window name
   if [ "$delay_secs" -gt 0 ]; then
     local win_name=""
@@ -1937,7 +1893,6 @@ cmd_fill() {
   [ -n "${passw:-}" ] && { _do_type "$passw" 20; sleep 0.08; }
   $enter_after && _do_key "Return"
   _frecency_record "$path"; ok "Autofilled ${path##*/}"
->>>>>>> dev:passx
 }
 
 cmd_url() {
@@ -2049,16 +2004,6 @@ cmd_rotate() {
   [ -z "${path:-}" ] && err "Usage: passx rotate <path> [length]"
   pass show "$path" >/dev/null 2>&1 || err "Entry not found: $path"
 
-<<<<<<< HEAD:passx-1.0.sh
-  local cur_len
-  cur_len="$(pass show "$path" | sed -n '1p' | tr -d '\n' | wc -c)"
-  printf "\n  ${C_YELLOW}${C_BOLD}Rotate password for '%s'?${C_RESET}\n" "$path" >&2
-  printf "  Current length: ${C_DIM}%d chars${C_RESET}  →  New length: ${C_BOLD}%d chars${C_RESET}\n" \
-    "$cur_len" "$length" >&2
-  printf "  Confirm [y/N]: " >&2
-  local yn; read -r yn </dev/tty || yn=""
-  [ "${yn,,}" != "y" ] && { dim "Aborted"; return 0; }
-=======
   if ! $no_confirm; then
     local cur_len
     cur_len="$(pass show "$path" | sed -n '1p' | tr -d '\n' | wc -c)"
@@ -2069,7 +2014,6 @@ cmd_rotate() {
     local yn; read -r yn </dev/tty || yn=""
     [ "${yn,,}" != "y" ] && { dim "Aborted"; return 0; }
   fi
->>>>>>> dev:passx
 
   local newpw rest
   newpw="$(gen_password "$length")"
@@ -2115,10 +2059,7 @@ cmd_edit() {
   _gpg_env
   env EDITOR="$editor" GPG_TTY="$GPG_TTY" pass edit "$path" \
     || err "Edit failed — check GPG key and pinentry setup"
-<<<<<<< HEAD:passx-1.0.sh
-=======
   _invalidate_cache
->>>>>>> dev:passx
   _hook post-edit "$path"
   _autosync
 }
@@ -3555,13 +3496,6 @@ ${C_BOLD}  OTP${C_RESET}
     All OTP pickers show only OTP-configured entries.
 
 ${C_BOLD}  AUTOMATION${C_RESET}
-<<<<<<< HEAD:passx-1.0.sh
-    ${C_GREEN}fill${C_RESET}     [-e] [-p|--pass] [-u|--user] [--delay N] [--no-delay]
-                 Autotype user + TAB + pass  (−e = press Enter after, 3s countdown)
-    ${C_GREEN}login${C_RESET}          Copy username + password together
-    ${C_GREEN}url${C_RESET}            Copy URL and open in browser
-    ${C_GREEN}run${C_RESET}     <cmd>  Inject creds as env vars — never in shell history
-=======
     ${C_GREEN}fill${C_RESET}  [-e] [-p] [-u] [--delay N] [--no-delay]
              X11: xdotool  |  Wayland: ydotool  — shows target window name in countdown
     ${C_GREEN}login${C_RESET} / ${C_GREEN}url${C_RESET} / ${C_GREEN}run${C_RESET} <cmd>  (ssh/psql/mysql/aws/kubectl/docker/vault/redis/mongo/...)
@@ -3571,7 +3505,6 @@ ${C_BOLD}  DATABASE MODE${C_RESET}
     ${C_GREEN}db${C_RESET} connect [path]         Interactive shell (pgcli/psql/mycli/redis-cli/mongosh)
     ${C_GREEN}db${C_RESET} query <path> <SQL>     Run one query non-interactively
     ${C_GREEN}db${C_RESET} tunnel [path]          SSH tunnel to remote database
->>>>>>> dev:passx
 
 ${C_BOLD}  SECRETS${C_RESET}
     ${C_GREEN}note${C_RESET} / ${C_GREEN}card${C_RESET} / ${C_GREEN}env${C_RESET} / ${C_GREEN}dotenv${C_RESET}
@@ -3611,22 +3544,10 @@ ${C_BOLD}  SETUP & CONFIG${C_RESET}
     ${C_GREEN}config${C_RESET} [get|set|reset|show]  /  ${C_GREEN}gen-conf${C_RESET}
 
 ${C_BOLD}  TOOLS${C_RESET}
-<<<<<<< HEAD:passx-1.0.sh
-    ${C_GREEN}sync${C_RESET}       Git push + pull  (use: sync status  to check without syncing)
-    ${C_GREEN}log${C_RESET}        Git history  (--graph, --all)
-    ${C_GREEN}doctor${C_RESET}     Dependency + env check
-    ${C_GREEN}stats${C_RESET}      Store statistics
-    ${C_GREEN}recent${C_RESET}     Recently modified entries
-    ${C_GREEN}backup${C_RESET}     Encrypted backup
-    ${C_GREEN}completions${C_RESET}  bash|zsh|fish  — print completion script
-    ${C_GREEN}fzf-widget${C_RESET}   bash|zsh|fish  — print Ctrl+P shell widget
-    ${C_GREEN}cron-check${C_RESET}   Silent audit for cron
-=======
     ${C_GREEN}sync${C_RESET} [status]  /  ${C_GREEN}log${C_RESET} [N] [--graph] [--all]  /  ${C_GREEN}doctor${C_RESET}
     ${C_GREEN}stats${C_RESET}  /  ${C_GREEN}recent${C_RESET}  /  ${C_GREEN}backup${C_RESET}  /  ${C_GREEN}git${C_RESET} <args>
     ${C_GREEN}completions${C_RESET} bash|zsh|fish  /  ${C_GREEN}fzf-widget${C_RESET} bash|zsh|fish
     ${C_GREEN}cron-check${C_RESET}   Silent audit for cron (exit 1 if problems)
->>>>>>> dev:passx
 
 ${C_BOLD}  ENVIRONMENT  (override or set in ~/.config/passx/passx.conf)${C_RESET}
     ${C_DIM}PASSWORD_STORE_DIR  PASSX_AUTOSYNC   PASSX_CLIP_TIMEOUT  PASSX_MAX_AGE${C_RESET}
@@ -5351,11 +5272,8 @@ case "${1:-}" in
   env)            shift; cmd_env "$@" ;;
   dotenv)         shift; cmd_dotenv "$@" ;;
   template|T|t)   shift; cmd_template "$@" ;;
-<<<<<<< HEAD:passx-1.0.sh
-=======
   template-new)   cmd_template_new ;;
   attach)         shift; cmd_attach "$@" ;;
->>>>>>> dev:passx
   # ── Security ──────────────────────────────────────────────
   strength)       shift; cmd_strength "$@" ;;
   entropy)        shift; cmd_entropy "$@" ;;
