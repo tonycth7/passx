@@ -2,7 +2,7 @@
 # passx installer
 #
 #   Remote (curl):
-#     bash <(curl -fsSL https://raw.githubusercontent.com/tonycth7/passx/main/install.sh)
+#     bash <(curl -fsSL https://raw.githubusercontent.com/tonycrt7/passx/main/install.sh)
 #     curl -fsSL .../install.sh | bash
 #     curl -fsSL .../install.sh | PREFIX=$HOME/.local bash
 #
@@ -17,7 +17,7 @@
 #
 set -euo pipefail
 
-REPO="tonycth7/passx"
+REPO="tonycrt7/passx"
 BRANCH="main"
 BASE_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 VERSION="1.7.0"
